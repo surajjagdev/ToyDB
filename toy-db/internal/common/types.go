@@ -4,18 +4,26 @@ package common
 // Defined in: internal/common/types.go
 type PageID uint32
 
-// SegmentID identifies a segment (file) of a table.
-// Default segment size is 1 GB. Starts at 0.
-// Pages are stored in files (for each table). Each page has a page id, but we have
-// a max number of pages per file per table. So we divide the table into segments.
-// Defined in: internal/common/types.go
-type SegmentID uint32
-
-// TableID identifies a table  in the db.
-// combination of table id + segment id + page id will
+// Relation identifies a table, index, etc  in the db.
 // uniquely identify a page
 // Defined in: internal/common/types.go
-type TableID uint32
+type RelationID uint32
+
+// Logical relations can have multiple physical files ie. forks
+// Defined in: internal/common/types.go
+// small number of unique file types
+type ForkID uint8
+
+const (
+	// ForkMain is the primary data fork of a relation.
+	ForkMain ForkID = iota
+
+	// ForkFSM stores free space metadata.
+	ForkFSM
+
+	// ForkVM stores visibility metadata.
+	ForkVM
+)
 
 // transaction number is u64 (8 bytes).
 // Defined in: internal/common/types.go

@@ -25,19 +25,11 @@ func TestMaxPageID(t *testing.T) {
 	}
 }
 
-// TestInvalidSegmentID tests the InvalidSegmentID constant
-func TestInvalidSegmentID(t *testing.T) {
-	var expected SegmentID = ^SegmentID(0)
-	if InvalidSegmentID != expected {
-		t.Fatalf("InvalidSegmentID = %v, want %v", InvalidSegmentID, expected)
-	}
-}
-
-// TestInvalidTableID tests the InvalidTableID constant
-func TestInvalidTableID(t *testing.T) {
-	var expected TableID = ^TableID(0)
-	if InvalidTableID != expected {
-		t.Fatalf("InvalidTableID = %v, want %v", InvalidTableID, expected)
+// TestInvalidRelationID tests the InvalidRelationID constant
+func TestInvalidRelationID(t *testing.T) {
+	var expected RelationID = ^RelationID(0)
+	if InvalidRelationID != expected {
+		t.Fatalf("InvalidRelationID = %v, want %v", InvalidRelationID, expected)
 	}
 }
 
