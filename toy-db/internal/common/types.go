@@ -1,5 +1,11 @@
 package common
 
+import "encoding/binary"
+
+// Global endiness. For reading and writing data
+// not for storing on disk (disk doesnt need to know)
+var ByteOrder = binary.LittleEndian
+
 // Page Id is a u32 (4 bytes) number.
 // Defined in: internal/common/types.go
 type PageID uint32

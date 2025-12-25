@@ -4,7 +4,6 @@ package disk
 // define endiness
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -14,9 +13,6 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/common"
 	//"github.com/surajjagdev/ToyDB/internal/common"
 )
-
-// Global endiness
-var ByteOrder = binary.LittleEndian
 
 type DiskManager struct {
 	baseDir string
@@ -43,7 +39,7 @@ func (d *DiskManager) Shutdown() error {
 
 // io ops
 
-// read a page
+// read a page using the relationid + fork (multiple pages)
 func (d *DiskManager) ReadPage(
 	rel common.RelationID,
 	fork common.ForkID,
@@ -79,6 +75,43 @@ func (d *DiskManager) ReadPage(
 	return nil
 }
 
+// write a page to disk
+func (d *DiskManager) WritePage(
+	rel common.RelationID,
+	fork common.ForkID,
+	page common.PageID,
+	data []byte,
+) error {
+
+	// check if correct page size
+	if len(data) != int(common.PageSize) {
+		return fmt.Errorf("buffer size %d != PageSize %d", len(data), common.PageSize)
+	}
+
+	// resolve path
+	path, offset := d.resolveLocation(rel, fork, page)
+
+	// acquire for vfd
+	entry, err := d.vfd.GetOrOpen(FileNode{Path: path}, os.O_RDWR|os.O_CREATE)
+
+	if err != nil {
+		return err
+	}
+
+	d.vfd.Acquire(entry)
+	defer d.vfd.Release(entry)
+
+	n, err := entry.file.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+	if n != int(common.PageSize) {
+		return fmt.Errorf("partial write (%d/%d)", n, common.PageSize)
+	}
+
+	return nil
+}
+
 // -----------------------------------------------------------------------------
 // Path Resolution
 // -----------------------------------------------------------------------------
@@ -101,6 +134,7 @@ func (d *DiskManager) segmentPath(
 	return fmt.Sprintf("%s.%d", base, segment)
 }
 
+// returns path and offset
 func (d *DiskManager) resolveLocation(
 	rel common.RelationID,
 	fork common.ForkID,
