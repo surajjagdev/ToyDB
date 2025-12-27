@@ -3,6 +3,7 @@ package disk
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -62,7 +63,7 @@ func TestGetOrOpen_NewFile(t *testing.T) {
 	if entry.file == nil {
 		t.Fatal("file is nil")
 	}
-	if entry.refCount != 0 {
+	if entry.refCount != 1 {
 		t.Errorf("refCount = %d, want 0", entry.refCount)
 	}
 	if cache.lruList.Len() != 1 {
@@ -120,6 +121,8 @@ func TestGetOrOpen_LRU_Eviction(t *testing.T) {
 	}
 	file1 := entry1.file
 
+	cache.Release(entry1)
+
 	// Open file2
 	entry2, err := cache.GetOrOpen(fn2, os.O_RDWR|os.O_CREATE)
 	if err != nil {
@@ -127,11 +130,15 @@ func TestGetOrOpen_LRU_Eviction(t *testing.T) {
 	}
 	file2 := entry2.file
 
+	cache.Release(entry2)
+
 	// Open file3 - should evict file1 (least recently used)
 	entry3, err := cache.GetOrOpen(fn3, os.O_RDWR|os.O_CREATE)
 	if err != nil {
 		t.Fatalf("GetOrOpen failed: %v", err)
 	}
+
+	cache.Release(entry3)
 
 	// Verify file1 was closed (evicted)
 	mustStatFail(t, file1)
@@ -161,8 +168,11 @@ func TestGetOrOpen_LRU_MoveToFront(t *testing.T) {
 
 	// Open files in order: fn1, fn2, fn3
 	e1, _ := cache.GetOrOpen(fn1, os.O_RDWR|os.O_CREATE)
+	cache.Release(e1)
 	e2, _ := cache.GetOrOpen(fn2, os.O_RDWR|os.O_CREATE)
+	cache.Release(e2)
 	e3, _ := cache.GetOrOpen(fn3, os.O_RDWR|os.O_CREATE)
+	cache.Release(e3)
 
 	// Access fn1 again → should move fn1 to front
 	cache.GetOrOpen(fn1, os.O_RDWR|os.O_CREATE)
@@ -214,20 +224,20 @@ func TestAcquire(t *testing.T) {
 		t.Fatalf("GetOrOpen failed: %v", err)
 	}
 
-	if entry.refCount != 0 {
-		t.Errorf("initial refCount = %d, want 0", entry.refCount)
+	if entry.refCount != 1 {
+		t.Errorf("initial refCount = %d, want 1", entry.refCount)
 	}
 
 	// Acquire entry
 	cache.Acquire(entry)
-	if entry.refCount != 1 {
-		t.Errorf("refCount after Acquire = %d, want 1", entry.refCount)
+	if entry.refCount != 2 {
+		t.Errorf("refCount after Acquire = %d, want 2", entry.refCount)
 	}
 
 	// Acquire again
 	cache.Acquire(entry)
-	if entry.refCount != 2 {
-		t.Errorf("refCount after second Acquire = %d, want 2", entry.refCount)
+	if entry.refCount != 3 {
+		t.Errorf("refCount after second Acquire = %d, want 3", entry.refCount)
 	}
 
 	// Verify entry moved to front
@@ -250,26 +260,21 @@ func TestRelease(t *testing.T) {
 	// Acquire twice
 	cache.Acquire(entry)
 	cache.Acquire(entry)
-	if entry.refCount != 2 {
-		t.Errorf("refCount = %d, want 2", entry.refCount)
+	if entry.refCount != 3 {
+		t.Errorf("refCount = %d, want 3", entry.refCount)
 	}
 
 	// Release once
 	cache.Release(entry)
-	if entry.refCount != 1 {
-		t.Errorf("refCount after Release = %d, want 1", entry.refCount)
+	if entry.refCount != 2 {
+		t.Errorf("refCount after Release = %d, want 2", entry.refCount)
 	}
 
-	// Release again
+	// Release again twice
+	cache.Release(entry)
 	cache.Release(entry)
 	if entry.refCount != 0 {
 		t.Errorf("refCount after second Release = %d, want 0", entry.refCount)
-	}
-
-	// Release when already at 0 - should not go negative
-	cache.Release(entry)
-	if entry.refCount != 0 {
-		t.Errorf("refCount after Release at 0 = %d, want 0", entry.refCount)
 	}
 }
 
@@ -285,8 +290,8 @@ func TestEvictOne_WithRefCount(t *testing.T) {
 	file1 := entry1.file
 	file2 := entry2.file
 
-	// Acquire entry1 - it should not be evicted
-	cache.Acquire(entry1)
+	// Release entry2, so entry1 should not be evicted
+	cache.Release(entry2)
 
 	// Try to add a third file - should evict entry2 (not entry1 due to refCount > 0)
 	fn3 := newTempFileNode(t, dir, "test3.txt")
@@ -355,8 +360,8 @@ func TestCloseAll_WithoutForce(t *testing.T) {
 	file1 := entry1.file
 	file2 := entry2.file
 
-	// Acquire entry1 - it should not be closed
-	cache.Acquire(entry1)
+	// Release entry 2
+	cache.Release(entry2)
 
 	// Close all without force
 	err := cache.CloseAll(false)
@@ -491,29 +496,42 @@ func TestAcquireRelease_Concurrent(t *testing.T) {
 	cache := NewVFDCache(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
-	entry, _ := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
+	// Initial acquire
+	entry, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Concurrent acquire/release
-	done := make(chan bool, 20)
-	for i := 0; i < 10; i++ {
+	const workers = 20
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	// Concurrent acquire + release
+	for i := 0; i < workers; i++ {
 		go func() {
-			cache.Acquire(entry)
-			done <- true
+			defer wg.Done()
+
+			// Acquire by calling GetOrOpen again
+			e, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
+			if err != nil {
+				t.Errorf("GetOrOpen failed: %v", err)
+				return
+			}
+
+			cache.Release(e)
 		}()
 	}
-	for i := 0; i < 10; i++ {
-		go func() {
-			cache.Release(entry)
-			done <- true
-		}()
-	}
 
-	// Wait for all goroutines
-	for i := 0; i < 20; i++ {
-		<-done
-	}
+	wg.Wait()
 
-	// Final refCount should be 0 (10 acquires - 10 releases)
+	// Release the initial acquire
+	cache.Release(entry)
+
+	// Final refCount should be 0
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
 	if entry.refCount != 0 {
 		t.Errorf("final refCount = %d, want 0", entry.refCount)
 	}
@@ -524,27 +542,20 @@ func TestAccessCountNeverBelowZero(t *testing.T) {
 	cache := NewVFDCache(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
-	entry, _ := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
-	cache.Acquire(entry)
-
-	if entry.refCount != 1 {
-		t.Errorf("Acquire refCount = %d, want 1", entry.refCount)
+	entry, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Concurrent release
-	done := make(chan bool, 10)
-	for i := 0; i < 10; i++ {
-		go func() {
-			cache.Release(entry)
-			done <- true
-		}()
-	}
+	// One valid release (brings refCount to 0)
+	cache.Release(entry)
 
-	for i := 0; i < 10; i++ {
-		<-done
-	}
+	// Second release should panic
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic on Release with refCount == 0")
+		}
+	}()
 
-	if entry.refCount != 0 {
-		t.Errorf("Acquire refCount = %d, want 0", entry.refCount)
-	}
+	cache.Release(entry) // should panic
 }

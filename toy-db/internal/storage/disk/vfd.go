@@ -88,6 +88,7 @@ func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
 	if entry, exists := v.cache[fn]; exists {
 		// move to front of list
 		v.lruList.MoveToFront(entry.elem)
+		entry.refCount++
 		return entry, nil
 	}
 
@@ -113,7 +114,7 @@ func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
 	newEntry := &vfdEntry{
 		fileNode: fn,
 		file:     file,
-		refCount: 0,
+		refCount: 1,
 		flags:    flags,
 	}
 
@@ -169,7 +170,9 @@ func (v *VFDCache) Release(e *vfdEntry) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if e.refCount > 0 {
-		e.refCount--
+	if e.refCount == 0 {
+		panic("VFDCache: Release without Acquire")
 	}
+
+	e.refCount--
 }

@@ -2,6 +2,8 @@ package disk
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,11 +12,11 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/common"
 )
 
-func newTestDM(t *testing.T) (*DiskManager, string) {
+func newTestDM(t *testing.T, maxOpenFiles int, maxCachedRelations int) (*DiskManager, string) {
 	t.Helper()
 
 	dir := t.TempDir()
-	dm, err := NewDiskManager(dir, 10)
+	dm, err := NewDiskManager(dir, maxOpenFiles, maxCachedRelations)
 	if err != nil {
 		t.Fatalf("NewDiskManager: %v", err)
 	}
@@ -66,7 +68,7 @@ func readPageFromDisk(
 }
 
 func TestResolveLocation(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	tests := []struct {
 		name     string
@@ -119,7 +121,7 @@ func TestResolveLocation(t *testing.T) {
 }
 
 func TestReadPage_Partial(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	path := filepath.Join(dir, "1")
 	writeFile(t, path, int(common.PageSize/2))
@@ -131,7 +133,7 @@ func TestReadPage_Partial(t *testing.T) {
 }
 
 func TestReadPage_FullRandom(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	path := filepath.Join(dir, "1")
 	writeFile(t, path, int(common.PageSize))
@@ -143,7 +145,7 @@ func TestReadPage_FullRandom(t *testing.T) {
 }
 
 func TestReadPage_MissingFile(t *testing.T) {
-	dm, _ := newTestDM(t)
+	dm, _ := newTestDM(t, 10, 100)
 
 	buf := make([]byte, common.PageSize)
 	if err := dm.ReadPage(1, common.ForkMain, 0, buf); err == nil {
@@ -153,7 +155,7 @@ func TestReadPage_MissingFile(t *testing.T) {
 
 // write file functional tests
 func TestWritePageToDisk(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
@@ -162,7 +164,7 @@ func TestWritePageToDisk(t *testing.T) {
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
 
 	// Write page
-	if err := dm.WritePage(rel, fork, page, data); err != nil {
+	if err := dm.WritePage(rel, fork, page, data, true); err != nil {
 		t.Fatalf("WritePage failed: %v", err)
 	}
 
@@ -184,8 +186,23 @@ func TestWritePageToDisk(t *testing.T) {
 	}
 }
 
+func TestWritePageToDiskPanicsWithoutFileExisting(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+	page := common.PageID(0)
+
+	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
+
+	// Write page
+	if err := dm.WritePage(rel, fork, page, data, false); err == nil {
+		t.Fatalf("WritePage success, however should have failed")
+	}
+}
+
 func TestWritePagePartialFail(t *testing.T) {
-	dm, _ := newTestDM(t)
+	dm, _ := newTestDM(t, 10, 100)
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
@@ -193,22 +210,22 @@ func TestWritePagePartialFail(t *testing.T) {
 
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize)/2)
 
-	if err := dm.WritePage(rel, fork, page, data); err == nil {
+	if err := dm.WritePage(rel, fork, page, data, true); err == nil {
 		t.Fatalf("Expected an error writing partial page")
 	}
 }
 
 // writing to same page and offset should not append
 func TestWritePageOverwrite(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	data1 := bytes.Repeat([]byte{0xAA}, int(common.PageSize))
 	data2 := bytes.Repeat([]byte{0xBB}, int(common.PageSize))
 
-	if err := dm.WritePage(1, common.ForkMain, 0, data1); err != nil {
+	if err := dm.WritePage(1, common.ForkMain, 0, data1, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := dm.WritePage(1, common.ForkMain, 0, data2); err != nil {
+	if err := dm.WritePage(1, common.ForkMain, 0, data2, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -223,12 +240,12 @@ func TestWritePageOverwrite(t *testing.T) {
 }
 
 func TestWritePageSegmentBoundary(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	page := common.PageID(common.MaxPagesPerSegment)
 	data := bytes.Repeat([]byte{0xDD}, int(common.PageSize))
 
-	if err := dm.WritePage(1, common.ForkMain, page, data); err != nil {
+	if err := dm.WritePage(1, common.ForkMain, page, data, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,15 +260,15 @@ func TestWritePageSegmentBoundary(t *testing.T) {
 }
 
 func TestWritePageForkIsolation(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	data1 := bytes.Repeat([]byte{0xEE}, int(common.PageSize))
 	data2 := bytes.Repeat([]byte{0xAA}, int(common.PageSize))
 
-	if err := dm.WritePage(1, common.ForkFSM, 0, data1); err != nil {
+	if err := dm.WritePage(1, common.ForkFSM, 0, data1, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := dm.WritePage(1, common.ForkMain, 0, data2); err != nil {
+	if err := dm.WritePage(1, common.ForkMain, 0, data2, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -271,15 +288,32 @@ func TestWritePageForkIsolation(t *testing.T) {
 	if bytes.Equal(data1, data2) {
 		t.Fatal("Main fork and FSM fork data should not match")
 	}
+
+	// Verify page counts
+	countFSM, err := dm.loadPageCountFromDisk(1, common.ForkFSM)
+	if err != nil {
+		t.Fatalf("failed to load page count for FSM: %v", err)
+	}
+	if countFSM != 1 {
+		t.Fatalf("expected FSM fork page count 1, got %d", countFSM)
+	}
+
+	countMain, err := dm.loadPageCountFromDisk(1, common.ForkMain)
+	if err != nil {
+		t.Fatalf("failed to load page count for Main: %v", err)
+	}
+	if countMain != 1 {
+		t.Fatalf("expected Main fork page count 1, got %d", countMain)
+	}
 }
 
 func TestWriteReadRoundTrip(t *testing.T) {
-	dm, _ := newTestDM(t)
+	dm, _ := newTestDM(t, 10, 100)
 
 	data := bytes.Repeat([]byte{0x5A}, int(common.PageSize))
 	buf := make([]byte, common.PageSize)
 
-	if err := dm.WritePage(1, common.ForkMain, 7, data); err != nil {
+	if err := dm.WritePage(1, common.ForkMain, 7, data, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := dm.ReadPage(1, common.ForkMain, 7, buf); err != nil {
@@ -292,7 +326,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 }
 
 func TestConcurrentWriteMonotonicPages(t *testing.T) {
-	dm, dir := newTestDM(t)
+	dm, dir := newTestDM(t, 10, 100)
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
@@ -316,7 +350,7 @@ func TestConcurrentWriteMonotonicPages(t *testing.T) {
 
 		go func(p common.PageID, d []byte) {
 			defer wg.Done()
-			if err := dm.WritePage(rel, fork, p, d); err != nil {
+			if err := dm.WritePage(rel, fork, p, d, true); err != nil {
 				t.Errorf("WritePage failed for page %d: %v", p, err)
 			}
 		}(page, data)
@@ -339,5 +373,406 @@ func TestConcurrentWriteMonotonicPages(t *testing.T) {
 		if !bytes.Equal(onDisk, dataArr[i]) {
 			t.Fatalf("page %d corrupted or mismatched", i)
 		}
+	}
+}
+
+func TestAllocatePage(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	for i := 0; i < 10; i++ {
+		pid, err := dm.AllocatePage(rel, fork)
+		if err != nil {
+			t.Fatalf("AllocatePage failed: %v", err)
+		}
+		if pid != common.PageID(i) {
+			t.Fatalf("expected page %d, got %d", i, pid)
+		}
+	}
+}
+
+func TestLRUEviction(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 5)
+
+	// allocate more entries than maxEntries (5)
+	for i := 0; i < 10; i++ {
+		rel := common.RelationID(i)
+		fork := common.ForkMain
+		_, err := dm.AllocatePage(rel, fork)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dm.countMu.Lock()
+	defer dm.countMu.Unlock()
+	if len(dm.pageCount) > dm.maxEntries {
+		t.Fatalf("pageCount exceeded maxEntries: %d > %d", len(dm.pageCount), dm.maxEntries)
+	}
+
+	// Ensure LRU removed oldest entries
+	for i := 0; i < 5; i++ {
+		rf := RelationFork{Rel: common.RelationID(i), Fork: common.ForkMain}
+		if _, ok := dm.pageCount[rf]; ok {
+			t.Errorf("old relation %v should have been evicted", rf)
+		}
+	}
+}
+
+func TestGetNumPages_CachedAndDisk(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	// Initially no pages, disk empty
+	num, err := dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num != 0 {
+		t.Fatalf("expected 0 pages initially, got %d", num)
+	}
+
+	// Write a page to disk
+	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
+	if err := dm.WritePage(rel, fork, 0, data, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should update pageCount cache
+	num, err = dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num != 1 {
+		t.Fatalf("expected 1 page after write, got %d", num)
+	}
+
+	// Write another page
+	if err := dm.WritePage(rel, fork, 2, data, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// GetNumPages should reflect highest written page + 1
+	num, err = dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num != 3 {
+		t.Fatalf("expected 3 pages after writing page 2, got %d", num)
+	}
+
+	// Check LRU touched
+	dm.countMu.Lock()
+	df, exists := dm.pageCount[RelationFork{Rel: rel, Fork: fork}]
+	dm.countMu.Unlock()
+	if !exists || df.elem == nil {
+		t.Fatal("expected dfEntry to exist and be in LRU list")
+	}
+}
+
+func TestGetNumPages_LoadFromDisk(t *testing.T) {
+	dm, dir := newTestDM(t, 10, 100)
+	rel := common.RelationID(5)
+	fork := common.ForkMain
+
+	// Write directly to disk (bypass cache)
+	path := filepath.Join(dir, "5")
+	writeFile(t, path, int(common.PageSize*4)) // 4 pages
+
+	num, err := dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num != 4 {
+		t.Fatalf("expected 4 pages from disk, got %d", num)
+	}
+
+	// Subsequent call should hit cache
+	num2, err := dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num2 != 4 {
+		t.Fatalf("expected 4 pages from cache, got %d", num2)
+	}
+}
+
+func TestGetNumPages_EmptyRelation(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+	rel := common.RelationID(999)
+	fork := common.ForkMain
+
+	num, err := dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num != 0 {
+		t.Fatalf("expected 0 pages for empty relation, got %d", num)
+	}
+}
+
+func TestSyncPage_PersistedData(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+	page := common.PageID(0)
+
+	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
+
+	// 1. Write a page
+	if err := dm.WritePage(rel, fork, page, data, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Sync the page
+	if err := dm.SyncPage(rel, fork, page); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Bypass VFD to simulate fresh open (like after a crash)
+	path, offset := dm.resolveLocation(rel, fork, page)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, common.PageSize)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if n != int(common.PageSize) {
+		t.Fatalf("short read: %d/%d", n, common.PageSize)
+	}
+
+	// 4. Check data matches
+	if !bytes.Equal(data, buf) {
+		t.Fatal("data on disk does not match after SyncPage")
+	}
+}
+
+func TestAllocatePage_Basic(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	// Allocate a few pages
+	for i := 0; i < 5; i++ {
+		pid, err := dm.AllocatePage(rel, fork)
+		if err != nil {
+			t.Fatalf("AllocatePage failed: %v", err)
+		}
+		if pid != common.PageID(i) {
+			t.Fatalf("AllocatePage returned %d, want %d", pid, i)
+		}
+	}
+
+	// Verify page count
+	numPages, err := dm.GetNumPages(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if numPages != 5 {
+		t.Fatalf("GetNumPages=%d, want 5", numPages)
+	}
+}
+
+func TestAllocatePage_CreatesSegment(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(2)
+	fork := common.ForkMain
+
+	pid, err := dm.AllocatePage(rel, fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 0 {
+		t.Fatalf("expected page 0, got %d", pid)
+	}
+
+	path := dm.segmentPath(rel, fork, 0)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("segment file not created: %v", err)
+	}
+}
+
+func TestAllocatePage_SingleSegmentOnly(t *testing.T) {
+	dm, dir := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	// Allocate multiple pages, but stay within first segment
+	n := int(common.MaxPagesPerSegment - 1)
+
+	for i := 0; i < n; i++ {
+		pid, err := dm.AllocatePage(rel, fork)
+		if err != nil {
+			t.Fatalf("AllocatePage failed: %v", err)
+		}
+		if pid != common.PageID(i) {
+			t.Fatalf("pid=%d, want %d", pid, i)
+		}
+	}
+
+	// Segment 0 MUST exist
+	seg0 := dm.segmentPath(rel, fork, 0)
+	if _, err := os.Stat(seg0); err != nil {
+		t.Fatalf("segment 0 missing: %v", err)
+	}
+
+	// Segment 1 MUST NOT exist
+	seg1 := dm.segmentPath(rel, fork, 1)
+	if _, err := os.Stat(seg1); !os.IsNotExist(err) {
+		t.Fatalf("segment 1 should not exist")
+	}
+
+	// Ensure no extra files exist
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 file, found %d", len(entries))
+	}
+}
+
+func TestAllocatePageCreatesNewSegment(t *testing.T) {
+	dm, dir := newTestDM(t, 10, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
+
+	// Fill first segment completely
+	for i := common.PageID(0); i < common.PageID(common.MaxPagesPerSegment); i++ {
+		page, err := dm.AllocatePage(rel, fork)
+		if err != nil {
+			t.Fatalf("AllocatePage failed: %v", err)
+		}
+		if page != i {
+			t.Fatalf("allocated page = %d, want %d", page, i)
+		}
+
+		if err := dm.WritePage(rel, fork, page, data, false); err != nil {
+			t.Fatalf("WritePage failed: %v", err)
+		}
+	}
+
+	// Allocate one more page → should create segment 1
+	page, err := dm.AllocatePage(rel, fork)
+	if err != nil {
+		t.Fatalf("AllocatePage failed: %v", err)
+	}
+	if page != common.PageID(common.MaxPagesPerSegment) {
+		t.Fatalf("allocated page = %d, want %d", page, common.MaxPagesPerSegment)
+	}
+
+	if err := dm.WritePage(rel, fork, page, data, false); err != nil {
+		t.Fatalf("WritePage failed: %v", err)
+	}
+
+	// test file with pages count
+	actualCount, err := dm.GetNumPages(rel, fork)
+
+	if err != nil {
+		t.Fatalf("GetNumPages failed: %v", err)
+	}
+
+	if actualCount != common.PageID(common.MaxPagesPerSegment+1) {
+		t.Fatalf("page count = %d, want %d", actualCount, common.MaxPagesPerSegment+1)
+	}
+
+	// Force close all files
+	_ = dm.vfd.CloseAll(false)
+
+	// ---- Verify filesystem state ----
+
+	seg0 := filepath.Join(dir, "1")
+	seg1 := filepath.Join(dir, "1.1")
+	seg2 := filepath.Join(dir, "1.2")
+
+	if _, err := os.Stat(seg0); err != nil {
+		t.Fatalf("segment 0 missing: %v", err)
+	}
+	if _, err := os.Stat(seg1); err != nil {
+		t.Fatalf("segment 1 missing: %v", err)
+	}
+	if _, err := os.Stat(seg2); !os.IsNotExist(err) {
+		t.Fatalf("unexpected segment 2 exists")
+	}
+}
+
+func TestAllocatePageConcurrent(t *testing.T) {
+	dm, dir := newTestDM(t, 50, 100)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	const workers = 64
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	results := make(chan common.PageID, workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			page, err := dm.AllocatePage(rel, fork)
+			if err != nil {
+				t.Errorf("AllocatePage failed: %v", err)
+				return
+			}
+			results <- page
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	// ---- Verify uniqueness ----
+
+	seen := make(map[common.PageID]bool)
+	for p := range results {
+		if seen[p] {
+			t.Fatalf("duplicate page ID allocated: %d", p)
+		}
+		seen[p] = true
+	}
+
+	if len(seen) != workers {
+		t.Fatalf("allocated pages = %d, want %d", len(seen), workers)
+	}
+
+	// ---- Verify segments on disk ----
+	_ = dm.vfd.CloseAll(false)
+
+	expectedSegments := (workers + common.MaxPagesPerSegment - 1) / common.MaxPagesPerSegment
+
+	for seg := 0; seg < int(expectedSegments); seg++ {
+		path := filepath.Join(dir, fmt.Sprintf("1.%d", seg))
+		if seg == 0 {
+			path = filepath.Join(dir, "1")
+		}
+
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("missing segment file %s", path)
+		}
+	}
+
+	// Ensure no extra segment was created
+	extra := filepath.Join(dir, fmt.Sprintf("1.%d", expectedSegments))
+	if _, err := os.Stat(extra); !os.IsNotExist(err) {
+		t.Fatalf("unexpected extra segment file %s", extra)
 	}
 }
