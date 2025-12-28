@@ -9,8 +9,8 @@ import (
 func TestNewPage(t *testing.T) {
 	p := NewPage()
 
-	if p.isDirty != false {
-		t.Fatalf("Dirty = %v, want %v", p.isDirty, false)
+	if p.IsDirty != false {
+		t.Fatalf("Page dirty bool = %v, want %v", p.IsDirty, 0)
 	}
 	if p.PinCount != 0 {
 		t.Fatalf("Pin count = %v, want %v", p.PinCount, 0)
@@ -35,15 +35,15 @@ func TestResetPage(t *testing.T) {
 		Rel:      common.InvalidRelationID / 2,
 		Fork:     common.ForkFSM,
 		PinCount: 1,
-		isDirty:  true,
+		IsDirty:  true,
 	}
 
 	p.Data[100] = 0xAA
 
 	p.Reset()
 
-	if p.isDirty == true {
-		t.Fatalf("Dirty = %v, want %v", p.isDirty, false)
+	if p.IsDirty == true {
+		t.Fatalf("Page dirty = %v, want %v", p.IsDirty, 0)
 	}
 	if p.PinCount == 1 {
 		t.Fatalf("Pin count = %v, want %v", p.PinCount, 0)
@@ -110,6 +110,117 @@ func TestPageIDAndLSNReadWrite(t *testing.T) {
 	}
 }
 
+func TestCopyDataIsolation(t *testing.T) {
+	p := NewPage()
+	p.Data[50] = 0xAA
+
+	copy := p.CopyData()
+	copy[50] = 0xBB
+
+	if p.Data[50] != 0xAA {
+		t.Fatal("CopyData must return a deep copy")
+	}
+}
+
+func TestPageLatches(t *testing.T) {
+	p := NewPage()
+
+	p.WLatch()
+	p.WUnlatch()
+
+	p.RLatch()
+	p.RUnlatch()
+}
+
+func TestPageFlagsReadWrite(t *testing.T) {
+	p := NewPage()
+
+	flags := PageFlagInitialized | PageFlagHeap | PageFlagLeaf
+	p.SetFlags(flags)
+
+	if got := p.GetFlags(); got != flags {
+		t.Fatalf("flags = %v, want %v", got, flags)
+	}
+}
+
+func TestPageAddClearFlags(t *testing.T) {
+	p := NewPage()
+
+	p.AddFlags(PageFlagHeap)
+	if !p.HasFlag(PageFlagHeap) {
+		t.Fatal("expected PageFlagHeap to be set")
+	}
+
+	p.AddFlags(PageFlagLeaf)
+	if !p.HasFlag(PageFlagLeaf) {
+		t.Fatal("expected PageFlagLeaf to be set")
+	}
+
+	p.ClearFlags(PageFlagHeap)
+	if p.HasFlag(PageFlagHeap) {
+		t.Fatal("PageFlagHeap should be cleared")
+	}
+
+	if !p.HasFlag(PageFlagLeaf) {
+		t.Fatal("PageFlagLeaf should remain set")
+	}
+}
+
+func TestPageLowerUpperInitialization(t *testing.T) {
+	p := NewPage()
+
+	p.SetLower(OffsetDataStart)
+	p.SetUpper(uint16(common.PageSize))
+
+	if p.GetLower() != OffsetDataStart {
+		t.Fatalf("lower = %d, want %d", p.GetLower(), OffsetDataStart)
+	}
+
+	if p.GetUpper() != uint16(common.PageSize) {
+		t.Fatalf("upper = %d, want %d", p.GetUpper(), common.PageSize)
+	}
+}
+
+func TestLowerUpperMovement(t *testing.T) {
+	p := NewPage()
+
+	p.SetLower(OffsetDataStart)
+	p.SetUpper(uint16(common.PageSize))
+
+	// Simulate adding a line pointer (4 bytes)
+	p.SetLower(p.GetLower() + 4)
+
+	// Simulate inserting a tuple (100 bytes)
+	p.SetUpper(p.GetUpper() - 100)
+
+	if p.GetLower() >= p.GetUpper() {
+		t.Fatal("lower must always be less than upper")
+	}
+}
+
+func TestPageDetectsNoFreeSpace(t *testing.T) {
+	p := NewPage()
+
+	p.SetLower(OffsetDataStart)
+	p.SetUpper(OffsetDataStart)
+
+	if p.GetLower() < p.GetUpper() {
+		t.Fatal("expected page to have no free space")
+	}
+}
+
+func TestSpecialAreaReadWrite(t *testing.T) {
+	p := NewPage()
+
+	b := uint16(0xA)
+	p.SetSpecial(b)
+
+	read := p.GetSpecial()
+	if read != b {
+		t.Fatalf("Special area bytes mismatch: got %d, want %d", read, b)
+	}
+}
+
 func TestPageChecksumValid(t *testing.T) {
 	p := NewPage()
 
@@ -157,6 +268,10 @@ func TestCheckSumTakesHeadersAndData(t *testing.T) {
 	p := NewPage()
 	p.SetLSN(common.InvalidLogSeqNumber / 2)
 	p.SetPageId(common.MaxPageID / 2)
+	p.SetFlags(PageFlagDeleted)
+	p.SetSpecial(uint16(0xA))
+	p.SetLower(OffsetDataStart)
+	p.SetUpper(uint16(common.PageSize))
 	p.Data[100] = 0xAA
 	p.UpdateChecksum()
 
@@ -166,29 +281,8 @@ func TestCheckSumTakesHeadersAndData(t *testing.T) {
 
 	// update page id, without recalculating the checksum
 	p.SetPageId((common.MaxPageID / 2) - 1)
+
 	if p.ValidateIntegrity() {
 		t.Fatal("checksum should fail after updating page id")
 	}
-}
-
-func TestCopyDataIsolation(t *testing.T) {
-	p := NewPage()
-	p.Data[50] = 0xAA
-
-	copy := p.CopyData()
-	copy[50] = 0xBB
-
-	if p.Data[50] != 0xAA {
-		t.Fatal("CopyData must return a deep copy")
-	}
-}
-
-func TestPageLatches(t *testing.T) {
-	p := NewPage()
-
-	p.WLatch()
-	p.WUnlatch()
-
-	p.RLatch()
-	p.RUnlatch()
 }

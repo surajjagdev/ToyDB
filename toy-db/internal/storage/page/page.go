@@ -35,6 +35,27 @@ const (
 	PageHeaderSize  = 24 // total header size
 )
 
+type PageFlags uint16
+
+const (
+	// Page lifecycle
+	PageFlagInitialized PageFlags = 1 << iota // page has been formatted
+
+	// Page kind (exactly ONE should be set)
+	PageFlagHeap
+	PageFlagIndex
+	PageFlagFSM
+	PageFlagVM
+
+	// Index-specific structure
+	PageFlagLeaf
+	PageFlagInternal
+	PageFlagRoot
+
+	// Page state
+	PageFlagDeleted // page is logically dead but not reclaimed
+)
+
 // To be used by buffer pool
 type Page struct {
 	PageID common.PageID
@@ -42,7 +63,7 @@ type Page struct {
 	Fork   common.ForkID
 
 	PinCount uint32
-	isDirty  bool
+	IsDirty  bool
 
 	// protect rw latch
 	rwLatch sync.RWMutex
@@ -58,7 +79,7 @@ func NewPage() *Page {
 		Rel:      common.InvalidRelationID,
 		Fork:     common.InvalidForkId,
 		PinCount: 0,
-		isDirty:  false,
+		IsDirty:  false,
 	}
 }
 
@@ -68,7 +89,7 @@ func (p *Page) Reset() {
 	p.Rel = common.InvalidRelationID
 	p.Fork = common.InvalidForkId
 	p.PinCount = 0
-	p.isDirty = false
+	p.IsDirty = false
 	// no need to reset bytes
 }
 
@@ -124,6 +145,52 @@ func (p *Page) GetPageID() common.PageID {
 // Set page id in header
 func (p *Page) SetPageId(pageID common.PageID) {
 	common.ByteOrder.PutUint32(p.Data[OffsetPageID:OffsetPageID+4], uint32(pageID))
+}
+
+// Get flags in header. Bytes 18-20
+func (p *Page) GetFlags() PageFlags {
+	val := PageFlags(common.ByteOrder.Uint16(p.Data[OffsetFlags : OffsetFlags+2]))
+	return val
+}
+
+func (p *Page) SetFlags(flags PageFlags) {
+	common.ByteOrder.PutUint16(p.Data[OffsetFlags:OffsetFlags+2], uint16(flags))
+}
+
+func (p *Page) AddFlags(flags PageFlags) {
+	p.SetFlags(p.GetFlags() | flags)
+}
+
+func (p *Page) ClearFlags(flags PageFlags) {
+	p.SetFlags(p.GetFlags() &^ flags)
+}
+
+func (p *Page) HasFlag(flag PageFlags) bool {
+	return p.GetFlags()&flag != 0
+}
+
+func (p *Page) GetLower() uint16 {
+	return common.ByteOrder.Uint16(p.Data[OffsetLower : OffsetLower+2])
+}
+
+func (p *Page) SetLower(v uint16) {
+	common.ByteOrder.PutUint16(p.Data[OffsetLower:OffsetLower+2], v)
+}
+
+func (p *Page) GetUpper() uint16 {
+	return common.ByteOrder.Uint16(p.Data[OffsetUpper : OffsetUpper+2])
+}
+
+func (p *Page) SetUpper(v uint16) {
+	common.ByteOrder.PutUint16(p.Data[OffsetUpper:OffsetUpper+2], v)
+}
+
+func (p *Page) GetSpecial() uint16 {
+	return common.ByteOrder.Uint16(p.Data[OffsetSpecial : OffsetSpecial+2])
+}
+
+func (p *Page) SetSpecial(v uint16) {
+	common.ByteOrder.PutUint16(p.Data[OffsetSpecial:OffsetSpecial+2], v)
 }
 
 // -----------------------------------------------------------------------------
