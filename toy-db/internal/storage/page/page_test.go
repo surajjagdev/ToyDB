@@ -9,20 +9,8 @@ import (
 func TestNewPage(t *testing.T) {
 	p := NewPage()
 
-	if p.IsDirty != false {
-		t.Fatalf("Page dirty bool = %v, want %v", p.IsDirty, 0)
-	}
-	if p.PinCount != 0 {
-		t.Fatalf("Pin count = %v, want %v", p.PinCount, 0)
-	}
 	if p.PageID != common.InvalidPageID {
-		t.Fatalf("Page id = %v, want %v", p.PinCount, common.InvalidPageID)
-	}
-	if p.Rel != common.InvalidRelationID {
-		t.Fatalf("Rel id = %v, want %v", p.Rel, common.InvalidRelationID)
-	}
-	if p.Fork != common.InvalidForkId {
-		t.Fatalf("Fork id = %v, want %v", p.Fork, common.InvalidForkId)
+		t.Fatalf("Page id = %v, want %v", p.PageID, common.InvalidPageID)
 	}
 	if len(p.Data) != int(common.PageSize) {
 		t.Fatalf("Data size (int) = %v, want %v", len(p.Data), int(common.PageSize))
@@ -31,31 +19,15 @@ func TestNewPage(t *testing.T) {
 
 func TestResetPage(t *testing.T) {
 	p := &Page{
-		PageID:   common.MaxPageID / 2,
-		Rel:      common.InvalidRelationID / 2,
-		Fork:     common.ForkFSM,
-		PinCount: 1,
-		IsDirty:  true,
+		PageID: common.MaxPageID / 2,
 	}
 
 	p.Data[100] = 0xAA
 
 	p.Reset()
 
-	if p.IsDirty == true {
-		t.Fatalf("Page dirty = %v, want %v", p.IsDirty, 0)
-	}
-	if p.PinCount == 1 {
-		t.Fatalf("Pin count = %v, want %v", p.PinCount, 0)
-	}
 	if p.PageID == common.MaxPageID/2 {
-		t.Fatalf("Page id = %v, want %v", p.PinCount, common.InvalidPageID)
-	}
-	if p.Rel == common.InvalidRelationID/2 {
-		t.Fatalf("Rel id = %v, want %v", p.Rel, common.InvalidRelationID)
-	}
-	if p.Fork == common.ForkFSM {
-		t.Fatalf("Fork id = %v, want %v", p.Fork, common.InvalidForkId)
+		t.Fatalf("Page id = %v, want %v", p.PageID, common.InvalidPageID)
 	}
 	if len(p.Data) != int(common.PageSize) {
 		t.Fatalf("Data size (int) = %v, want %v", len(p.Data), int(common.PageSize))

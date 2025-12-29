@@ -59,11 +59,6 @@ const (
 // To be used by buffer pool
 type Page struct {
 	PageID common.PageID
-	Rel    common.RelationID
-	Fork   common.ForkID
-
-	PinCount uint32
-	IsDirty  bool
 
 	// protect rw latch
 	rwLatch sync.RWMutex
@@ -75,21 +70,13 @@ type Page struct {
 // Creates empty Page
 func NewPage() *Page {
 	return &Page{
-		PageID:   common.InvalidPageID,
-		Rel:      common.InvalidRelationID,
-		Fork:     common.InvalidForkId,
-		PinCount: 0,
-		IsDirty:  false,
+		PageID: common.InvalidPageID,
 	}
 }
 
 // Reset a page
 func (p *Page) Reset() {
 	p.PageID = common.InvalidPageID
-	p.Rel = common.InvalidRelationID
-	p.Fork = common.InvalidForkId
-	p.PinCount = 0
-	p.IsDirty = false
 	// no need to reset bytes
 }
 
