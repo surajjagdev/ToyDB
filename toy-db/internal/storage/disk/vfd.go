@@ -14,6 +14,8 @@ type FileNode struct {
 	Path string
 }
 
+type OpenDiskFileFunc func(path string, flags int) (*os.File, error)
+
 type vfdEntry struct {
 	fileNode FileNode
 	flags    int
@@ -32,13 +34,27 @@ type VFDCache struct {
 
 	// Ordering: Front = Most Recently Used, Back = Least Recently Used
 	lruList *list.List
+
+	openFile OpenDiskFileFunc
 }
 
-func NewVFDCache(capacity int) *VFDCache {
+func NewCachedVFD(capacity int) *VFDCache {
 	return &VFDCache{
 		capacity: capacity,
 		cache:    make(map[FileNode]*vfdEntry),
 		lruList:  list.New(),
+		openFile: func(path string, flags int) (*os.File, error) {
+			return os.OpenFile(path, flags, 0666)
+		},
+	}
+}
+
+func NewDirectVFD(capacity int) *VFDCache {
+	return &VFDCache{
+		capacity: capacity,
+		cache:    make(map[FileNode]*vfdEntry),
+		lruList:  list.New(),
+		openFile: openDirect, // OS-specific
 	}
 }
 
@@ -105,7 +121,7 @@ func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
 	// O_RDWR: Read/Write
 	// O_CREATE: Create file if it doesn't exist
 	// 0666: Standard RW permissions
-	file, err := os.OpenFile(fn.Path, flags, 0666)
+	file, err := v.openFile(fn.Path, flags)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %s: %w", fn.Path, err)

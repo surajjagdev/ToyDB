@@ -7,7 +7,11 @@ import (
 )
 
 func TestNewPage(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	if p.PageID != common.InvalidPageID {
 		t.Fatalf("Page id = %v, want %v", p.PageID, common.InvalidPageID)
@@ -18,9 +22,13 @@ func TestNewPage(t *testing.T) {
 }
 
 func TestResetPage(t *testing.T) {
-	p := &Page{
-		PageID: common.MaxPageID / 2,
+	p, err := NewPage()
+
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
+
+	p.PageID = common.MaxPageID / 2
 
 	p.Data[100] = 0xAA
 
@@ -40,7 +48,10 @@ func TestResetPage(t *testing.T) {
 }
 
 func TestLSNReadWrite(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	lsn := common.LogSeqNumber(12345)
 	p.SetLSN(lsn)
@@ -52,7 +63,11 @@ func TestLSNReadWrite(t *testing.T) {
 }
 
 func TestPageIDReadWrite(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	id := common.PageID(12345)
 	p.SetPageId(id)
@@ -64,7 +79,11 @@ func TestPageIDReadWrite(t *testing.T) {
 }
 
 func TestPageIDAndLSNReadWrite(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	id := common.PageID(12345)
 	lsn := common.LogSeqNumber(99999)
@@ -83,7 +102,10 @@ func TestPageIDAndLSNReadWrite(t *testing.T) {
 }
 
 func TestCopyDataIsolation(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 	p.Data[50] = 0xAA
 
 	copy := p.CopyData()
@@ -95,7 +117,10 @@ func TestCopyDataIsolation(t *testing.T) {
 }
 
 func TestPageLatches(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.WLatch()
 	p.WUnlatch()
@@ -105,7 +130,10 @@ func TestPageLatches(t *testing.T) {
 }
 
 func TestPageFlagsReadWrite(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	flags := PageFlagInitialized | PageFlagHeap | PageFlagLeaf
 	p.SetFlags(flags)
@@ -116,7 +144,10 @@ func TestPageFlagsReadWrite(t *testing.T) {
 }
 
 func TestPageAddClearFlags(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.AddFlags(PageFlagHeap)
 	if !p.HasFlag(PageFlagHeap) {
@@ -139,7 +170,10 @@ func TestPageAddClearFlags(t *testing.T) {
 }
 
 func TestPageLowerUpperInitialization(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.SetLower(OffsetDataStart)
 	p.SetUpper(uint16(common.PageSize))
@@ -154,7 +188,10 @@ func TestPageLowerUpperInitialization(t *testing.T) {
 }
 
 func TestLowerUpperMovement(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.SetLower(OffsetDataStart)
 	p.SetUpper(uint16(common.PageSize))
@@ -171,7 +208,10 @@ func TestLowerUpperMovement(t *testing.T) {
 }
 
 func TestPageDetectsNoFreeSpace(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.SetLower(OffsetDataStart)
 	p.SetUpper(OffsetDataStart)
@@ -182,7 +222,10 @@ func TestPageDetectsNoFreeSpace(t *testing.T) {
 }
 
 func TestSpecialAreaReadWrite(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	b := uint16(0xA)
 	p.SetSpecial(b)
@@ -194,7 +237,10 @@ func TestSpecialAreaReadWrite(t *testing.T) {
 }
 
 func TestPageChecksumValid(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	// Fill page with deterministic data
 	for i := OffsetDataStart; i < int(common.PageSize); i++ {
@@ -209,7 +255,10 @@ func TestPageChecksumValid(t *testing.T) {
 }
 
 func TestPageChecksumDetectsCorruption(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.Data[100] = 0xAA
 	p.UpdateChecksum()
@@ -223,7 +272,11 @@ func TestPageChecksumDetectsCorruption(t *testing.T) {
 }
 
 func TestChecksumDoesNotIncludeChecksumField(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	p.Data[OffsetDataStart] = 0x11
 	p.UpdateChecksum()
@@ -237,7 +290,10 @@ func TestChecksumDoesNotIncludeChecksumField(t *testing.T) {
 }
 
 func TestCheckSumTakesHeadersAndData(t *testing.T) {
-	p := NewPage()
+	p, err := NewPage()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 	p.SetLSN(common.InvalidLogSeqNumber / 2)
 	p.SetPageId(common.MaxPageID / 2)
 	p.SetFlags(PageFlagDeleted)

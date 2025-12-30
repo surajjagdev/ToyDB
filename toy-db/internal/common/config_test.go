@@ -4,8 +4,8 @@ import "testing"
 
 // TestPageSize tests the PageSize constant
 func TestPageSize(t *testing.T) {
-	if PageSize != 4096 {
-		t.Fatalf("PageSize = %d, want 4096", PageSize)
+	if PageSize != 8192 {
+		t.Fatalf("PageSize = %d, want 8192", PageSize)
 	}
 }
 
