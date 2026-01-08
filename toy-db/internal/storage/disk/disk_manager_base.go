@@ -15,6 +15,7 @@ type DiskManager interface {
 	WritePage(rel common.RelationID, fork common.ForkID, page common.PageID, data []byte) error
 	AllocatePage(rel common.RelationID, fork common.ForkID) (common.PageID, error)
 	SyncPage(rel common.RelationID, fork common.ForkID, page common.PageID) error
+	SyncDir(rel common.RelationID, fork common.ForkID) error
 	GetNumPages(rel common.RelationID, fork common.ForkID) (common.PageID, error)
 	Shutdown() error
 }
@@ -152,6 +153,23 @@ func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (co
 	d.countMu.Unlock()
 
 	return actualCount, nil
+}
+
+// Sync directory on new seg creation
+func (m *ManagerBase) SyncDir(rel common.RelationID, fork common.ForkID) error {
+	// Any segment path works; we just need the directory
+	segPath := m.segmentPath(rel, fork, 0)
+	dirPath := filepath.Dir(segPath)
+
+	// skip vfd
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	// fsync directory metadata
+	return dir.Sync()
 }
 
 // -----------------------------------------------------------------------------

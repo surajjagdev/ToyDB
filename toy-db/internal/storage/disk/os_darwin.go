@@ -28,5 +28,6 @@ func assertDirectIO(_ []byte, _ int64) error {
 }
 
 func directSync(file *os.File) error {
-	return file.Sync()
+	_, err := unix.FcntlInt(file.Fd(), unix.F_FULLFSYNC, 0)
+	return err
 }

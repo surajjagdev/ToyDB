@@ -48,6 +48,29 @@ func TestDirectManager_WriteReadPage(t *testing.T) {
 	}
 }
 
+func TestDirectManagerWriteFailsWithoutAllocation(t *testing.T) {
+	tmpDir := t.TempDir()
+	dm, _ := NewDirectManager(tmpDir, 10, 10)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+	pid := common.PageID(0)
+
+	// write page
+	// Prepare buffer
+	data := make([]byte, common.PageSize)
+
+	for i := 0; i < len(data); i++ {
+		data[i] = byte(i % 256)
+	}
+
+	err := dm.WritePage(rel, fork, pid, data, false)
+
+	if err == nil {
+		t.Fatalf("Write page should have failed but has passed")
+	}
+}
+
 func TestDirectManager_FileCreated(t *testing.T) {
 	tmpDir := t.TempDir()
 	dm, _ := NewDirectManager(tmpDir, 10, 10)
@@ -109,5 +132,47 @@ func TestDirectManagerAllocatePage(t *testing.T) {
 		if pid != common.PageID(i) {
 			t.Fatalf("expected page %d, got %d", i, pid)
 		}
+	}
+}
+
+func TestDirectManagerFsync(t *testing.T) {
+	tmpDir := t.TempDir()
+	dm, _ := NewDirectManager(tmpDir, 10, 10)
+
+	rel := common.RelationID(1)
+	fork := common.ForkMain
+
+	pid, err := dm.AllocatePage(rel, fork)
+
+	if err != nil {
+		t.Fatalf("AllocatePage failed: %v", err)
+	}
+
+	// write page
+	// Prepare buffer
+	data := make([]byte, common.PageSize)
+	for i := 0; i < len(data); i++ {
+		data[i] = byte(i % 256)
+	}
+
+	err = dm.WritePage(rel, fork, pid, data, false)
+
+	if err != nil {
+		t.Fatalf("Write page failed: %v", err)
+	}
+
+	// fsync contents and try to read it
+	err = dm.SyncPage(rel, fork, pid)
+
+	if err != nil {
+		t.Fatalf("Fsync failed for single page: %v", err)
+	}
+
+	readBuffer := make([]byte, common.PageSize)
+
+	err = dm.ReadPage(rel, fork, pid, readBuffer)
+
+	if err != nil {
+		t.Fatalf("Read page failed: %v", err)
 	}
 }
