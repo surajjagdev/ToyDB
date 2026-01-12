@@ -1,8 +1,7 @@
-// page_linux.go
 //go:build linux
 // +build linux
 
-package page
+package buffer
 
 /*
 #include <stdlib.h>

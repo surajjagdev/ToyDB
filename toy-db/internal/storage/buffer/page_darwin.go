@@ -2,7 +2,7 @@
 //go:build darwin
 // +build darwin
 
-package page
+package buffer
 
 import (
 	"unsafe"
