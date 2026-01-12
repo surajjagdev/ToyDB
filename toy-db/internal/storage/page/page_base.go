@@ -40,8 +40,13 @@ func Init(p Page, flags PageFlags) {
 		panic("page.Init: invalid page size")
 	}
 
-	// Optional: zero page
+	p.ResetPage(flags)
+}
+
+func (p Page) ResetPage(flags PageFlags) {
 	p.zeroPageMemory()
+
+	p.SetPageId(common.InvalidPageID)
 
 	// LSN starts invalid / zero
 	p.SetLSN(0)

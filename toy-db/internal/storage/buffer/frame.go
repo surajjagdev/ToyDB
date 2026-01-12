@@ -60,9 +60,12 @@ func (f *Frame) CopyData() (page.Page, unsafe.Pointer) {
 // Reset
 // -----------------------------------------------------------------------------
 
-func (f *Frame) Reset() {
+func (f *Frame) Reset(flags page.PageFlags) {
+	f.Page.ResetPage(flags)
+
+	f.pinCnt = 0
+	f.dirty = false
 	f.PageID = common.InvalidPageID
-	// Data bytes can remain; optional: zeroing if needed
 }
 
 // -----------------------------------------------------------------------------
