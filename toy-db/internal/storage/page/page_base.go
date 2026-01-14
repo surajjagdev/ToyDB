@@ -7,15 +7,18 @@ import (
 )
 
 const (
-	OffsetPageLSN   = 0
-	OffsetPageID    = 8
-	OffsetLower     = 12
-	OffsetUpper     = 14
-	OffsetSpecial   = 16
-	OffsetFlags     = 18
-	OffsetChecksum  = 20
-	OffsetDataStart = 24
-	PageHeaderSize  = 24
+	OffsetPageLSN            = 0  // 64 bit
+	OffsetPageID             = 8  // 32 bit
+	OffsetLower              = 12 // 16 bit
+	OffsetUpper              = 14 // 16 bit
+	OffsetSpecial            = 16 // 16 bit
+	OffsetFlags              = 18 // 16 bit
+	OffsetPageVersion        = 20 // 16 bit
+	OffsetPageVersionPadding = 22 // 16 bit padding
+	OffsetChecksum           = 24 // 32 bit
+	OffsetReservedPadding    = 28 // 32 bit padding
+	OffsetDataStart          = 32
+	PageHeaderSize           = 32
 )
 
 type PageFlags uint16
@@ -55,6 +58,7 @@ func (p Page) ResetPage(flags PageFlags) {
 	p.SetLower(PageHeaderSize)
 	p.SetUpper(uint16(common.PageSize))
 	p.SetSpecial(uint16(common.PageSize))
+	p.SetPageVersion()
 
 	// Set page type flags (heap, index, etc.)
 	p.SetFlags(flags | PageFlagInitialized)
@@ -112,6 +116,37 @@ func (p Page) GetLower() uint16  { return common.ByteOrder.Uint16(p[OffsetLower 
 func (p Page) SetLower(v uint16) { common.ByteOrder.PutUint16(p[OffsetLower:OffsetLower+2], v) }
 func (p Page) GetUpper() uint16  { return common.ByteOrder.Uint16(p[OffsetUpper : OffsetUpper+2]) }
 func (p Page) SetUpper(v uint16) { common.ByteOrder.PutUint16(p[OffsetUpper:OffsetUpper+2], v) }
+func (p Page) SetPageVersion() {
+	// take size of page (e.g.8192) / 512 to fit into 12 bits
+	pg_size_code := uint16(common.PageSize / common.PageSectorSize)
+	// take the remainder shift 12 bits left, upper 12 bits are size and xor with page version
+	// to get 16 bits
+	v := (pg_size_code << common.PageSizeShift) | common.CurrentPageVersion
+
+	common.ByteOrder.PutUint16(
+		p[OffsetPageVersion:OffsetPageVersion+2],
+		v,
+	)
+}
+
+func (p Page) GetPageVersion() uint16 {
+	v := common.ByteOrder.Uint16(p[OffsetPageVersion : OffsetPageVersion+2])
+
+	// and with page version mask which is 4 bits as 1. e.g. 1111
+
+	return v & common.PageVersionMask
+}
+
+func (p Page) GetPageSize() uint64 {
+	v := common.ByteOrder.Uint16(p[OffsetPageVersion : OffsetPageVersion+2])
+
+	// PageSizeMask is 12 bits as 1, shifted by 4 (page version)
+	// 1111 1111 1111 0000, then shift by 4 bits, bc value is 16 times larger without it
+	pgSz := (v & common.PageSizeMask)
+	sizeCode := pgSz >> common.PageSizeShift
+	return uint64(sizeCode) * common.PageSectorSize
+}
+
 func (p Page) GetSpecial() uint16 {
 	return common.ByteOrder.Uint16(p[OffsetSpecial : OffsetSpecial+2])
 }

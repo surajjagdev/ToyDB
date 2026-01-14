@@ -31,6 +31,12 @@ func TestPageInit(t *testing.T) {
 	if p.GetSpecial() != uint16(common.PageSize) {
 		t.Fatalf("special = %d, want %d", p.GetSpecial(), common.PageSize)
 	}
+	if p.GetPageVersion() != common.CurrentPageVersion {
+		t.Fatalf("page version = %d, want %d", p.GetPageVersion(), common.CurrentPageVersion)
+	}
+	if p.GetPageSize() != common.PageSize {
+		t.Fatalf("page size = %d, want %d", p.GetPageSize(), common.PageSize)
+	}
 }
 
 func TestLSNReadWrite(t *testing.T) {
@@ -52,6 +58,22 @@ func TestPageIDReadWrite(t *testing.T) {
 
 	if got := p.GetPageID(); got != id {
 		t.Fatalf("PageID = %d, want %d", got, id)
+	}
+}
+
+func TestPageVersionReadWrite(t *testing.T) {
+	p := newTestPage(t)
+
+	p.SetPageVersion()
+
+	setPageVersion := p.GetPageVersion()
+	setPageSize := p.GetPageSize()
+
+	if setPageVersion != common.CurrentPageVersion {
+		t.Fatalf("Page version = %d, want %d", setPageVersion, common.CurrentPageVersion)
+	}
+	if setPageSize != common.PageSize {
+		t.Fatalf("Page size = %d, want %d", setPageSize, common.PageSize)
 	}
 }
 
