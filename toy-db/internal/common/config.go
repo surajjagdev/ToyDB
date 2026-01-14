@@ -1,7 +1,22 @@
 package common
 
 const (
-	PageSize           = uint64(8192)               // Max Page size 8 KB
+	PageSize = uint64(8192) // Max Page size 8 KB
+
+	PageVersionBits = 4
+	PageSizeBits    = 12
+
+	// Shifts
+	PageVersionShift = 0
+	PageSizeShift    = PageVersionBits // 4
+
+	// Masks
+	PageVersionMask uint16 = (1 << PageVersionBits) - 1     // 0x000F
+	PageSizeMask    uint16 = ((1 << PageSizeBits) - 1) << 4 // 0xFFF0
+
+	PageSectorSize     uint64 = 512
+	CurrentPageVersion uint16 = 1
+
 	MaxSegmentSize     = uint64(1024 * 1024 * 1024) // Max File Size, 1 GB
 	DataFileExtension  = ".data"                    // File extension constant
 	MaxPagesPerSegment = MaxSegmentSize / PageSize  // Max number of pages allowed per file
