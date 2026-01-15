@@ -49,6 +49,22 @@ func TestMaxTransactionID(t *testing.T) {
 	}
 }
 
+// TestInvalidCommandID tests the InvalidTransactionID constant
+func TestInvalidCommandID(t *testing.T) {
+	var expected CommandID = ^CommandID(0)
+	if InvalidCommandID != expected {
+		t.Fatalf("InvalidCommandIDs = %v, want %v", InvalidCommandID, expected)
+	}
+}
+
+// TestMaxCommandID tests the MaxCommandID constant
+func TestMaxCommandID(t *testing.T) {
+	var expected CommandID = InvalidCommandID - 1
+	if MaxCommandID != expected {
+		t.Fatalf("MaxCommandID = %v, want %v", MaxCommandID, expected)
+	}
+}
+
 // TestInvalidLogSeqNumber tests the InvalidLogSeqNumber constant
 func TestInvalidLogSeqNumber(t *testing.T) {
 	var expected LogSeqNumber = ^LogSeqNumber(0)

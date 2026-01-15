@@ -31,9 +31,13 @@ const (
 	ForkVM
 )
 
-// transaction number is u64 (8 bytes).
+// transaction number is u32 (4 bytes).
 // Defined in: internal/common/types.go
-type TransactionID uint64
+type TransactionID uint32
+
+// command id (cid) number is u32 (4 bytes).
+// Defined in: internal/common/types.go
+type CommandID uint32
 
 // Log seq number is u64 (8 bytes).
 // Defined in: internal/common/types.go

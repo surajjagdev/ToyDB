@@ -27,8 +27,10 @@ const (
 	MaxPageID            PageID        = InvalidPageID - 1
 	InvalidForkId        ForkID        = ^ForkID(0)
 	InvalidRelationID    RelationID    = ^RelationID(0)
-	InvalidTransactionID TransactionID = TransactionID(^uint64(0))
+	InvalidTransactionID TransactionID = TransactionID(^uint32(0))
 	MaxTransactionID     TransactionID = InvalidTransactionID - 1
+	InvalidCommandID     CommandID     = CommandID(^uint32(0))
+	MaxCommandID         CommandID     = InvalidCommandID - 1
 	InvalidLogSeqNumber  LogSeqNumber  = LogSeqNumber(^uint64(0))
 	MaxLogSeqNumber      LogSeqNumber  = InvalidLogSeqNumber - 1
 )
