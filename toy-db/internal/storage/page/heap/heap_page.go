@@ -1,4 +1,11 @@
-package page
+package heap
+
+import (
+	"fmt"
+
+	"github.com/surajjagdev/ToyDB/internal/common"
+	"github.com/surajjagdev/ToyDB/internal/storage/page"
+)
 
 // Base page layout
 // +--------------------+  Offset 0
@@ -76,7 +83,49 @@ const (
 	HeapTupleHeaderAlign   = 8  // MAXALIGN
 )
 
-// Assuming page already alloced fill data
-func NewHeapPage() {
+type HeapPage struct {
+	page.Page
+}
 
+// Assuming page already alloc'ed, set the
+// page header and flags
+func InitHeapPage(p page.Page) *HeapPage {
+	page.InitBasePage(p, page.PageFlagHeap)
+
+	// set lower, upper and special
+	p.SetLower(page.PageHeaderSize)
+	p.SetUpper(uint16(common.PageSize))
+	p.SetSpecial(uint16(common.PageSize))
+
+	return &HeapPage{
+		p,
+	}
+}
+
+// Get the avail free space
+func (h *HeapPage) GetFreeSpace() int {
+	return int(h.GetUpper() - h.GetLower())
+}
+
+// tuple crud
+
+func (h *HeapPage) InsertTuple(data []byte, xmin common.TransactionID, commandId common.CommandID) error {
+	// 1. calc tuple size, header min size + user data
+	tupleSize := HeapTupleHeaderMinSize + len(data)
+	tupleSize = page.AlignTo(tupleSize, HeapTupleHeaderAlign)
+
+	upper := h.GetUpper()
+	lower := h.GetLower()
+
+	// 2. check available space in page
+	if int(upper-lower) < ItemIdSize+tupleSize {
+		return fmt.Errorf("Page is full")
+	}
+
+	// 3. There is free space, so update upper
+	newUpper := upper - uint16(tupleSize) // tuple size can fit in uint16
+	//tupleOffset := newUpper
+	h.SetUpper(newUpper)
+
+	return nil
 }

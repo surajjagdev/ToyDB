@@ -6,10 +6,20 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/common"
 )
 
+func TestAlignTo(t *testing.T) {
+	sz := 13
+	align := 8
+	expected := 16
+
+	if got := AlignTo(sz, align); got != expected {
+		t.Fatalf("Alignment = %d, want %d", got, expected)
+	}
+}
+
 func newTestPage(t *testing.T) Page {
 	t.Helper()
-	p := make([]byte, common.PageSize)
-	Init(p, PageFlagInitialized)
+	p := Page(make([]byte, common.PageSize))
+	InitBasePage(p, PageFlagInitialized)
 	return p
 }
 
@@ -20,17 +30,6 @@ func TestPageInit(t *testing.T) {
 		t.Fatal("page should be initialized")
 	}
 
-	if p.GetLower() != PageHeaderSize {
-		t.Fatalf("lower = %d, want %d", p.GetLower(), PageHeaderSize)
-	}
-
-	if p.GetUpper() != uint16(common.PageSize) {
-		t.Fatalf("upper = %d, want %d", p.GetUpper(), common.PageSize)
-	}
-
-	if p.GetSpecial() != uint16(common.PageSize) {
-		t.Fatalf("special = %d, want %d", p.GetSpecial(), common.PageSize)
-	}
 	if p.GetPageVersion() != common.CurrentPageVersion {
 		t.Fatalf("page version = %d, want %d", p.GetPageVersion(), common.CurrentPageVersion)
 	}

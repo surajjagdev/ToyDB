@@ -38,7 +38,7 @@ const (
 type Page []byte
 
 // init
-func Init(p Page, flags PageFlags) {
+func InitBasePage(p Page, flags PageFlags) {
 	if uint64(len(p)) != common.PageSize {
 		panic("page.Init: invalid page size")
 	}
@@ -55,9 +55,9 @@ func (p Page) ResetPage(flags PageFlags) {
 	p.SetLSN(0)
 
 	// empty
-	p.SetLower(PageHeaderSize)
-	p.SetUpper(uint16(common.PageSize))
-	p.SetSpecial(uint16(common.PageSize))
+	// p.SetLower(PageHeaderSize)
+	// p.SetUpper(uint16(common.PageSize))
+	// p.SetSpecial(uint16(common.PageSize))
 	p.SetPageVersion()
 
 	// Set page type flags (heap, index, etc.)
@@ -172,4 +172,19 @@ func (p Page) UpdateChecksum() {
 func (p Page) ValidateIntegrity() bool {
 	stored := common.ByteOrder.Uint32(p[OffsetChecksum : OffsetChecksum+4])
 	return stored == p.calculateChecksum()
+}
+
+// general function to align. Returns smallest next multiple of alignment
+func AlignTo(sz int, alignment int) int {
+	// e.g. sz = 13, alignment = 8
+	// boundary = 13 + 8 - 1 = 20
+	// alignmentMask = ^(8 - 1) = ^(7) = ^(0b00000111) = (11111000). Clears lower bits
+	// boundary & alignmentMask
+	// 00010100
+	// 11111000
+	// 00010000 = 16
+	boundary := (sz + alignment - 1)
+	alignmentMask := ^(alignment - 1)
+
+	return boundary & alignmentMask
 }
