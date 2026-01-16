@@ -1,6 +1,7 @@
 package heap
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
@@ -38,8 +39,9 @@ ItemId:
 Tuple Layout:
 [ HeapTupleHeader | UserData ]
 */
+// before the tuples
 const (
-	ItemIdSize = 4
+	ItemIdSize = 4 // 4 bytes per slot, containing tuple offset, flag and tuple size
 )
 
 const (
@@ -75,7 +77,7 @@ const (
 	// 0-10 bits for number of attributes, 11-15 bits for HOT / key-update flags
 	TupleHeaderOffsetInfomask = 20 // uint16
 	//Byte offset from tuple start to first attribute, fixed header, null bitmap, padding for alignment
-	TupleHeaderOffsetHoff = 22 // uint8
+	TupleHeaderOffsetHoff = 22 // uint8 -> null bitmap
 
 	// Header sizes
 	// Minimum header without w/o null bitmap
@@ -107,9 +109,31 @@ func (h *HeapPage) GetFreeSpace() int {
 	return int(h.GetUpper() - h.GetLower())
 }
 
+func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint16) {
+	// offset: top 15 bits
+	offset = uint16(v >> 17)
+
+	// flags: next 2 bits
+	twoBitMask := ^uint32(0) >> 30 // for last 2 bits
+	flags = uint8((v >> 15) & twoBitMask)
+
+	// size: remaining 15 bits (low bits)
+	fifteenBitMask := ^uint32(0) >> 17
+	size = uint16(v & fifteenBitMask)
+}
+
 // tuple crud
 
-func (h *HeapPage) InsertTuple(data []byte, xmin common.TransactionID, commandId common.CommandID) error {
+func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
+	slotOffset := page.PageHeaderSize + slot*ItemIdSize
+
+	// read the 4 bytes for item composed of tuple offset, flag and tuple size
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
+	offset, _, size := h.UnpackItemId(v)
+	return h.Page[offset : offset+size]
+}
+
+func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.TransactionID, ctid common.CommandID) error {
 	// 1. calc tuple size, header min size + user data
 	tupleSize := HeapTupleHeaderMinSize + len(data)
 	tupleSize = page.AlignTo(tupleSize, HeapTupleHeaderAlign)
@@ -124,8 +148,79 @@ func (h *HeapPage) InsertTuple(data []byte, xmin common.TransactionID, commandId
 
 	// 3. There is free space, so update upper
 	newUpper := upper - uint16(tupleSize) // tuple size can fit in uint16
-	//tupleOffset := newUpper
+	// start of where we can insert new tuple
+	tupleOffset := newUpper
 	h.SetUpper(newUpper)
+
+	// 4. Write tuple from new offset
+	tuple := h.Page[tupleOffset : tupleOffset+uint16(tupleOffset)]
+
+	// add xmin
+	common.ByteOrder.PutUint32(
+		tuple[TupleHeaderOffsetXmin:TupleHeaderOffsetXmin+4],
+		uint32(xmin),
+	)
+
+	// add xmax (not deleted)
+	common.ByteOrder.PutUint32(
+		tuple[TupleHeaderOffsetXmax:TupleHeaderOffsetXmax+4],
+		uint32(0),
+	)
+
+	// add in command id
+	common.ByteOrder.PutUint32(
+		tuple[TupleHeaderOffsetCid:TupleHeaderOffsetCid+4],
+		uint32(ctid),
+	)
+
+	// add info masks
+	// infomask / infomask2 stubbed for now
+	common.ByteOrder.PutUint16(
+		tuple[TupleHeaderOffsetInfomask:TupleHeaderOffsetInfomask+2],
+		uint16(0),
+	)
+	common.ByteOrder.PutUint16(
+		tuple[TupleHeaderOffsetInfomask2:TupleHeaderOffsetInfomask2+2],
+		uint16(0),
+	)
+
+	// hoff (no null bitmap)
+	tuple[TupleHeaderOffsetHoff] = HeapTupleHeaderMinSize
+
+	copy(
+		tuple[TupleHeaderOffsetHoff:],
+		data,
+	)
+
+	// 5.  fill the slot items
+	slotOffset := lower
+	h.SetLower(lower + ItemIdSize)
+
+	slotIndex := (slotOffset - page.PageHeaderSize) / ItemIdSize
+
+	itemId := uint32(0)
+	itemId |= uint32(tupleOffset) << 17      // set 15 bits for tupleoffset
+	itemId |= uint32(ItemIdFlagNormal) << 15 // set next 2 bits for tuple flag
+	itemId |= uint32(tupleSize)              // set remaining 15 bits for tuple size
+
+	common.ByteOrder.PutUint32(
+		h.Page[slotOffset:slotOffset+4],
+		itemId,
+	)
+
+	// ---- self ctid ----
+
+	// write first 4 bytes as pageid
+	// points to self. if new version, can be a different page
+	binary.LittleEndian.PutUint32(
+		tuple[TupleHeaderOffsetCtid:],
+		uint32(pageId),
+	)
+	// write new 2 bytes as slotindex
+	binary.LittleEndian.PutUint16(
+		tuple[TupleHeaderOffsetCtid+4:],
+		uint16(slotIndex),
+	)
 
 	return nil
 }
