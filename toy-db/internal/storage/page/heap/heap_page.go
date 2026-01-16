@@ -133,7 +133,7 @@ func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
 	return h.Page[offset : offset+size]
 }
 
-func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.TransactionID, ctid common.CommandID) error {
+func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.TransactionID, cid common.CommandID) error {
 	// 1. calc tuple size, header min size + user data
 	tupleSize := HeapTupleHeaderMinSize + len(data)
 	tupleSize = page.AlignTo(tupleSize, HeapTupleHeaderAlign)
@@ -170,7 +170,7 @@ func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.Tr
 	// add in command id
 	common.ByteOrder.PutUint32(
 		tuple[TupleHeaderOffsetCid:TupleHeaderOffsetCid+4],
-		uint32(ctid),
+		uint32(cid),
 	)
 
 	// add info masks
