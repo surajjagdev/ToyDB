@@ -153,7 +153,7 @@ func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.Tr
 	h.SetUpper(newUpper)
 
 	// 4. Write tuple from new offset
-	tuple := h.Page[tupleOffset : tupleOffset+uint16(tupleOffset)]
+	tuple := h.Page[tupleOffset : tupleOffset+uint16(tupleSize)]
 
 	// add xmin
 	common.ByteOrder.PutUint32(
