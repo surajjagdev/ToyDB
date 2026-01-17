@@ -54,7 +54,7 @@ const (
 	ItemIdRedirect = 1 << 2
 
 	//tuple is deleted, can be vaccummed
-	ItemIdDeleted = 1 << 3
+	ItemIdDeleted = 1 << 3 // only mark via vaccumm, so indexes can lazily remove
 )
 
 const (
@@ -123,10 +123,31 @@ func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint
 	return offset, flags, size
 }
 
+// get the slot index, based on slot position.
+// not guaranteed to exist
+func getSlotOffset(slot int) int {
+	return page.PageHeaderSize + slot*ItemIdSize
+}
+
+func (h *HeapPage) validateSlot(slot int) bool {
+	slotOffset := getSlotOffset(slot)
+
+	// slot is referring to unclaimed space, so it is
+	// not valid
+	if slotOffset+ItemIdSize > int(h.GetLower()) {
+		return false
+	}
+
+	return true
+}
+
 // tuple crud
 
+// Get the tuple from page using the slot index.
+// Does not validate if slot index exists, so should be
+// done before
 func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
-	slotOffset := page.PageHeaderSize + slot*ItemIdSize
+	slotOffset := getSlotOffset(slot)
 
 	// read the 4 bytes for item composed of tuple offset, flag and tuple size
 	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
@@ -233,6 +254,75 @@ func (h *HeapPage) InsertTuple(
 		tuple[TupleHeaderOffsetCtid+4:],
 		uint16(slotIndex),
 	)
+
+	return nil
+}
+
+// Logical Deletion of tuple from page
+func (h *HeapPage) DeleteTuple(
+	slot int,
+	xmax common.TransactionID,
+	cid common.CommandID,
+) error {
+	// 1. validate the slot
+	slotOffset := getSlotOffset(slot)
+
+	if exists := h.validateSlot(slot); !exists {
+		return fmt.Errorf("invalid slot %d", slot)
+	}
+
+	// slot is referring to unclaimed space, so it is
+	// not valid
+	if slotOffset+ItemIdSize > int(h.GetLower()) {
+		return fmt.Errorf("invalid slot %d", slot)
+	}
+
+	// 2. get tuple slot
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
+
+	// unpack the flags from tuple
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	// check if tuple is ok to be marked as deleted
+	switch flags {
+	case ItemIdFlagUnused:
+		return fmt.Errorf("tuple already removed")
+
+	case ItemIdDeleted:
+		return fmt.Errorf("tuple already deleted")
+
+	case ItemIdRedirect:
+		return fmt.Errorf("cannot delete redirect slot")
+
+	case ItemIdFlagNormal:
+		// ok
+	default:
+		return fmt.Errorf("unknown itemId flag")
+	}
+
+	// 3. Get actual tuple using offset
+	tuple := h.Page[tupleOffset : tupleOffset+size]
+
+	// check old xmax
+	oldXmax := common.ByteOrder.Uint32(
+		tuple[TupleHeaderOffsetXmax : TupleHeaderOffsetXmax+4],
+	)
+
+	if oldXmax != 0 {
+		return fmt.Errorf("Tuple already deleted by txn id %v", oldXmax)
+	}
+
+	// set new xmax and cid
+	common.ByteOrder.PutUint32(
+		tuple[TupleHeaderOffsetXmax:TupleHeaderOffsetXmax+4],
+		uint32(xmax),
+	)
+	common.ByteOrder.PutUint32(
+		tuple[TupleHeaderOffsetCid:TupleHeaderOffsetCid+4],
+		uint32(cid),
+	)
+
+	// 4. Update infomask (future)
 
 	return nil
 }

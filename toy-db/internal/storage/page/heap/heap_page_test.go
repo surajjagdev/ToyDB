@@ -146,3 +146,98 @@ func TestTupleInsertMultiple(t *testing.T) {
 		t.Fatalf("ctid mismatch: got (%d,%d)", pageId, slot)
 	}
 }
+
+func TestTupleInsertMultipleAndDelete(t *testing.T) {
+	p := page.Page(make([]byte, common.PageSize))
+	h := InitHeapPage(p)
+
+	data1 := make([]byte, common.PageSize/10)
+	data2 := make([]byte, common.PageSize/12)
+	for i := 0; i < len(data1); i++ {
+		data1[i] = byte(i)
+	}
+	for i := 0; i < len(data2); i++ {
+		data2[i] = byte(i)
+	}
+
+	err := h.InsertTuple(data1, common.PageID(1), common.TransactionID(1), common.CommandID(0))
+	if err != nil {
+		t.Fatalf("failed tuple insert %v", err)
+	}
+	err = h.InsertTuple(data2, common.PageID(1), common.TransactionID(1), common.CommandID(1))
+	if err != nil {
+		t.Fatalf("failed tuple insert %v", err)
+	}
+
+	// delete tuple 1
+	err = h.DeleteTuple(0, common.TransactionID(2), common.CommandID(0))
+	if err != nil {
+		t.Fatalf("failed delete tuple %v", err)
+	}
+
+	// get the physical tuple, still should be alive
+	tuple := h.GetTupleWithSlot(0)
+
+	if tuple == nil {
+		t.Fatalf("tuple is nil")
+	}
+
+	// read the xmax contents of the tuple and cid
+	readXmax := common.ByteOrder.Uint32(tuple[TupleHeaderOffsetXmax : TupleHeaderOffsetXmax+4])
+
+	if common.TransactionID(readXmax) != common.TransactionID(2) {
+		t.Fatalf("Expected xmax to be set after logically deleting the tuple. Expected %v, got %v", common.TransactionID(2), readXmax)
+	}
+}
+
+func TestFreeSpace(t *testing.T) {
+	p := page.Page(make([]byte, common.PageSize))
+	h := InitHeapPage(p)
+
+	freeSpace := h.GetFreeSpace()
+	expectedFreeSpace := h.GetUpper() - h.GetLower()
+
+	if expectedFreeSpace != uint16(freeSpace) {
+		t.Fatalf("Expected freespace to equal %v, got %v", expectedFreeSpace, freeSpace)
+	}
+}
+
+func TestSlotOffset(t *testing.T) {
+	expected0 := page.PageHeaderSize + 0*ItemIdSize
+	if got := getSlotOffset(0); got != expected0 {
+		t.Fatalf("Expected slot offset to equal %v, got %v", expected0, got)
+	}
+	expected1 := page.PageHeaderSize + 6*ItemIdSize
+	if got := getSlotOffset(6); got != expected1 {
+		t.Fatalf("Expected slot offset to equal %v, got %v", expected1, got)
+	}
+}
+
+func TestValidateSlotOffset(t *testing.T) {
+	p := page.Page(make([]byte, common.PageSize))
+	h := InitHeapPage(p)
+
+	data := make([]byte, common.PageSize/9)
+	for i := 0; i < len(data); i++ {
+		data[i] = byte(i)
+	}
+
+	initialFreeSpace := h.GetFreeSpace()
+
+	h.InsertTuple(data, common.PageID(0), common.MaxTransactionID-1, common.MaxCommandID-1)
+
+	newFreeSpace := h.GetFreeSpace()
+
+	if newFreeSpace >= initialFreeSpace {
+		t.Fatalf("Expected tuple to occupy space in page and reduce free space.")
+	}
+
+	// verify slot 0 exists
+	if slot0Exists := h.validateSlot(0); !slot0Exists {
+		t.Fatalf("Expected slot index 0 to exist")
+	}
+
+	if slot12Exists := h.validateSlot(12); slot12Exists {
+		t.Fatalf("Expected slot index 12 to not exist")
+	}
+}
