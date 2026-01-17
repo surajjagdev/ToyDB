@@ -109,15 +109,15 @@ func (h *HeapPage) GetFreeSpace() int {
 }
 
 func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint16) {
-	// offset: top 15 bits
+	// top 15 bits
 	offset = uint16(v >> 17)
 
-	// flags: next 2 bits
-	twoBitMask := ^uint32(0) >> 30 // for last 2 bits
-	flags = uint8((v >> 15) & twoBitMask)
+	// next 2 bits
+	twobitMask := uint32((1 << 2) - 1)
+	flags = uint8((v >> 15) & twobitMask)
 
-	// size: remaining 15 bits (low bits)
-	fifteenBitMask := ^uint32(0) >> 17
+	// bottom 15 bits
+	fifteenBitMask := uint32(((1 << 15) - 1))
 	size = uint16(v & fifteenBitMask)
 
 	return offset, flags, size
