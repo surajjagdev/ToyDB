@@ -1,7 +1,6 @@
 package heap
 
 import (
-	"encoding/binary"
 	"fmt"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
@@ -120,6 +119,8 @@ func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint
 	// size: remaining 15 bits (low bits)
 	fifteenBitMask := ^uint32(0) >> 17
 	size = uint16(v & fifteenBitMask)
+
+	return offset, flags, size
 }
 
 // tuple crud
@@ -133,75 +134,89 @@ func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
 	return h.Page[offset : offset+size]
 }
 
-func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.TransactionID, cid common.CommandID) error {
-	// 1. calc tuple size, header min size + user data
-	tupleSize := HeapTupleHeaderMinSize + len(data)
+// Insert a single tuple into the page
+func (h *HeapPage) InsertTuple(
+	data []byte,
+	pageId common.PageID,
+	xmin common.TransactionID,
+	cid common.CommandID,
+) error {
+
+	// 1. Compute header offset (aligned)
+	hoff := page.AlignTo(HeapTupleHeaderMinSize, HeapTupleHeaderAlign)
+
+	// 2. Compute total tuple size (aligned as a whole)
+	tupleSize := hoff + len(data)
 	tupleSize = page.AlignTo(tupleSize, HeapTupleHeaderAlign)
 
 	upper := h.GetUpper()
 	lower := h.GetLower()
 
-	// 2. check available space in page
+	// 3. Check available space
 	if int(upper-lower) < ItemIdSize+tupleSize {
-		return fmt.Errorf("Page is full")
+		return fmt.Errorf("page is full")
 	}
 
-	// 3. There is free space, so update upper
-	newUpper := upper - uint16(tupleSize) // tuple size can fit in uint16
-	// start of where we can insert new tuple
+	// 4. Allocate space from upper (tuples grow downward)
+	newUpper := upper - uint16(tupleSize)
 	tupleOffset := newUpper
 	h.SetUpper(newUpper)
 
-	// 4. Write tuple from new offset
+	// 5. Slice tuple space
 	tuple := h.Page[tupleOffset : tupleOffset+uint16(tupleSize)]
 
-	// add xmin
+	// ---- tuple header ----
+
+	// xmin
 	common.ByteOrder.PutUint32(
 		tuple[TupleHeaderOffsetXmin:TupleHeaderOffsetXmin+4],
 		uint32(xmin),
 	)
 
-	// add xmax (not deleted)
+	// xmax (not deleted)
 	common.ByteOrder.PutUint32(
 		tuple[TupleHeaderOffsetXmax:TupleHeaderOffsetXmax+4],
-		uint32(0),
+		0,
 	)
 
-	// add in command id
+	// command id
 	common.ByteOrder.PutUint32(
 		tuple[TupleHeaderOffsetCid:TupleHeaderOffsetCid+4],
 		uint32(cid),
 	)
 
-	// add info masks
-	// infomask / infomask2 stubbed for now
+	// infomask / infomask2 (stubbed)
 	common.ByteOrder.PutUint16(
 		tuple[TupleHeaderOffsetInfomask:TupleHeaderOffsetInfomask+2],
-		uint16(0),
+		0,
 	)
 	common.ByteOrder.PutUint16(
 		tuple[TupleHeaderOffsetInfomask2:TupleHeaderOffsetInfomask2+2],
-		uint16(0),
+		0,
 	)
 
-	// hoff (no null bitmap)
-	tuple[TupleHeaderOffsetHoff] = HeapTupleHeaderMinSize
+	// hoff (aligned header size)
+	tuple[TupleHeaderOffsetHoff] = uint8(hoff)
 
-	copy(
-		tuple[TupleHeaderOffsetHoff:],
-		data,
-	)
+	// ---- user data ----
+	copy(tuple[int(hoff):], data)
 
-	// 5.  fill the slot items
+	// zero memory for padding
+	for i := int(hoff) + len(data); i < len(tuple); i++ {
+		tuple[i] = 0
+	}
+
+	// ---- itemId slot ----
+
 	slotOffset := lower
 	h.SetLower(lower + ItemIdSize)
 
 	slotIndex := (slotOffset - page.PageHeaderSize) / ItemIdSize
 
 	itemId := uint32(0)
-	itemId |= uint32(tupleOffset) << 17      // set 15 bits for tupleoffset
-	itemId |= uint32(ItemIdFlagNormal) << 15 // set next 2 bits for tuple flag
-	itemId |= uint32(tupleSize)              // set remaining 15 bits for tuple size
+	itemId |= uint32(tupleOffset) << 17      // offset (15 bits)
+	itemId |= uint32(ItemIdFlagNormal) << 15 // flags (2 bits)
+	itemId |= uint32(tupleSize)              // size (15 bits)
 
 	common.ByteOrder.PutUint32(
 		h.Page[slotOffset:slotOffset+4],
@@ -210,14 +225,11 @@ func (h *HeapPage) InsertTuple(data []byte, pageId common.PageID, xmin common.Tr
 
 	// ---- self ctid ----
 
-	// write first 4 bytes as pageid
-	// points to self. if new version, can be a different page
-	binary.LittleEndian.PutUint32(
+	common.ByteOrder.PutUint32(
 		tuple[TupleHeaderOffsetCtid:],
 		uint32(pageId),
 	)
-	// write new 2 bytes as slotindex
-	binary.LittleEndian.PutUint16(
+	common.ByteOrder.PutUint16(
 		tuple[TupleHeaderOffsetCtid+4:],
 		uint16(slotIndex),
 	)
