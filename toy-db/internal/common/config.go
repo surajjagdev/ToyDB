@@ -1,7 +1,22 @@
 package common
 
 const (
-	PageSize           = uint64(4096)               // Max Page size 4 KB
+	PageSize = uint64(8192) // Max Page size 8 KB
+
+	PageVersionBits = 4
+	PageSizeBits    = 12
+
+	// Shifts
+	PageVersionShift = 0
+	PageSizeShift    = PageVersionBits // 4
+
+	// Masks
+	PageVersionMask uint16 = (1 << PageVersionBits) - 1     // 0x000F
+	PageSizeMask    uint16 = ((1 << PageSizeBits) - 1) << 4 // 0xFFF0
+
+	PageSectorSize     uint64 = 512
+	CurrentPageVersion uint16 = 1
+
 	MaxSegmentSize     = uint64(1024 * 1024 * 1024) // Max File Size, 1 GB
 	DataFileExtension  = ".data"                    // File extension constant
 	MaxPagesPerSegment = MaxSegmentSize / PageSize  // Max number of pages allowed per file
@@ -12,8 +27,10 @@ const (
 	MaxPageID            PageID        = InvalidPageID - 1
 	InvalidForkId        ForkID        = ^ForkID(0)
 	InvalidRelationID    RelationID    = ^RelationID(0)
-	InvalidTransactionID TransactionID = TransactionID(^uint64(0))
+	InvalidTransactionID TransactionID = TransactionID(^uint32(0))
 	MaxTransactionID     TransactionID = InvalidTransactionID - 1
+	InvalidCommandID     CommandID     = CommandID(^uint32(0))
+	MaxCommandID         CommandID     = InvalidCommandID - 1
 	InvalidLogSeqNumber  LogSeqNumber  = LogSeqNumber(^uint64(0))
 	MaxLogSeqNumber      LogSeqNumber  = InvalidLogSeqNumber - 1
 )

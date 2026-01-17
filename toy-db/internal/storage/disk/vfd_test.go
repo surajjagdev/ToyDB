@@ -22,10 +22,10 @@ func mustStatFail(t *testing.T, f *os.File) {
 }
 
 // test if we get an accurate struct
-func TestNewVFDCache(t *testing.T) {
-	cache := NewVFDCache(10)
+func TestNewCachedVFD(t *testing.T) {
+	cache := NewCachedVFD(10)
 	if cache == nil {
-		t.Fatal("NewVFDCache returned nil")
+		t.Fatal("NewCachedVFD returned nil")
 	}
 	if cache.capacity != 10 {
 		t.Errorf("capacity = %d, want 10", cache.capacity)
@@ -47,7 +47,7 @@ func TestNewVFDCache(t *testing.T) {
 // test if file can be created
 func TestGetOrOpen_NewFile(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	entry, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
@@ -82,7 +82,7 @@ func TestGetOrOpen_NewFile(t *testing.T) {
 // See if we hit cache
 func TestGetOrOpen_Cached(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	entry1, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
@@ -109,7 +109,7 @@ func TestGetOrOpen_Cached(t *testing.T) {
 
 func TestGetOrOpen_LRU_Eviction(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(2) // Small capacity for testing
+	cache := NewCachedVFD(2) // Small capacity for testing
 	fn1 := newTempFileNode(t, dir, "test1.txt")
 	fn2 := newTempFileNode(t, dir, "test2.txt")
 	fn3 := newTempFileNode(t, dir, "test3.txt")
@@ -159,7 +159,7 @@ func TestGetOrOpen_LRU_Eviction(t *testing.T) {
 
 func TestGetOrOpen_LRU_MoveToFront(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(3)
+	cache := NewCachedVFD(3)
 
 	fn1 := newTempFileNode(t, dir, "test1.txt")
 	fn2 := newTempFileNode(t, dir, "test2.txt")
@@ -216,7 +216,7 @@ func TestGetOrOpen_LRU_MoveToFront(t *testing.T) {
 
 func TestAcquire(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	entry, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
@@ -249,7 +249,7 @@ func TestAcquire(t *testing.T) {
 
 func TestRelease(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	entry, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)
@@ -280,7 +280,7 @@ func TestRelease(t *testing.T) {
 
 func TestEvictOne_WithRefCount(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(2)
+	cache := NewCachedVFD(2)
 	fn1 := newTempFileNode(t, dir, "test1.txt")
 	fn2 := newTempFileNode(t, dir, "test2.txt")
 
@@ -311,7 +311,7 @@ func TestEvictOne_WithRefCount(t *testing.T) {
 
 func TestEvictOne_AllHaveRefCount(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(2)
+	cache := NewCachedVFD(2)
 	fn1 := newTempFileNode(t, dir, "test1.txt")
 	fn2 := newTempFileNode(t, dir, "test2.txt")
 
@@ -350,7 +350,7 @@ func TestEvictOne_AllHaveRefCount(t *testing.T) {
 
 func TestCloseAll_WithoutForce(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn1 := newTempFileNode(t, dir, "test1.txt")
 	fn2 := newTempFileNode(t, dir, "test2.txt")
 
@@ -401,7 +401,7 @@ func TestCloseAll_WithoutForce(t *testing.T) {
 
 func TestCloseAll_WithForce(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn1 := newTempFileNode(t, dir, "test1.txt")
 	fn2 := newTempFileNode(t, dir, "test2.txt")
 
@@ -435,7 +435,7 @@ func TestCloseAll_WithForce(t *testing.T) {
 }
 
 func TestCloseAll_EmptyCache(t *testing.T) {
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 
 	err := cache.CloseAll(false)
 	if err != nil {
@@ -450,7 +450,7 @@ func TestCloseAll_EmptyCache(t *testing.T) {
 
 func TestGetOrOpen_NonExistentFile_ReadOnly(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "nonexistent.txt")
 
 	// Try to open non-existent file without O_CREATE
@@ -462,7 +462,7 @@ func TestGetOrOpen_NonExistentFile_ReadOnly(t *testing.T) {
 
 func TestConcurrentAccess(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	// Test concurrent GetOrOpen
@@ -493,7 +493,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 func TestAcquireRelease_Concurrent(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	// Initial acquire
@@ -539,7 +539,7 @@ func TestAcquireRelease_Concurrent(t *testing.T) {
 
 func TestAccessCountNeverBelowZero(t *testing.T) {
 	dir := t.TempDir()
-	cache := NewVFDCache(10)
+	cache := NewCachedVFD(10)
 	fn := newTempFileNode(t, dir, "test1.txt")
 
 	entry, err := cache.GetOrOpen(fn, os.O_RDWR|os.O_CREATE)

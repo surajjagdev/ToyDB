@@ -12,13 +12,18 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/common"
 )
 
-func newTestDM(t *testing.T, maxOpenFiles int, maxCachedRelations int) (*DiskManager, string) {
+func newTestDM(t *testing.T, maxOpenFiles int, maxCachedRelations int) (*CachedManager, string) {
 	t.Helper()
 
 	dir := t.TempDir()
-	dm, err := NewDiskManager(dir, maxOpenFiles, maxCachedRelations)
+
+	dm, err := NewCachedManager(
+		dir,
+		maxOpenFiles,
+		maxCachedRelations,
+	)
 	if err != nil {
-		t.Fatalf("NewDiskManager: %v", err)
+		t.Fatalf("NewDiskManagerCached: %v", err)
 	}
 	return dm, dir
 }

@@ -4,8 +4,8 @@ import "testing"
 
 // TestPageSize tests the PageSize constant
 func TestPageSize(t *testing.T) {
-	if PageSize != 4096 {
-		t.Fatalf("PageSize = %d, want 4096", PageSize)
+	if PageSize != 8192 {
+		t.Fatalf("PageSize = %d, want 8192", PageSize)
 	}
 }
 
@@ -46,6 +46,22 @@ func TestMaxTransactionID(t *testing.T) {
 	var expected TransactionID = InvalidTransactionID - 1
 	if MaxTransactionID != expected {
 		t.Fatalf("MaxTransactionID = %v, want %v", MaxTransactionID, expected)
+	}
+}
+
+// TestInvalidCommandID tests the InvalidTransactionID constant
+func TestInvalidCommandID(t *testing.T) {
+	var expected CommandID = ^CommandID(0)
+	if InvalidCommandID != expected {
+		t.Fatalf("InvalidCommandIDs = %v, want %v", InvalidCommandID, expected)
+	}
+}
+
+// TestMaxCommandID tests the MaxCommandID constant
+func TestMaxCommandID(t *testing.T) {
+	var expected CommandID = InvalidCommandID - 1
+	if MaxCommandID != expected {
+		t.Fatalf("MaxCommandID = %v, want %v", MaxCommandID, expected)
 	}
 }
 
