@@ -77,7 +77,7 @@ func TestResolveLocation(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		page     common.PageID
+		page     common.BlockID
 		fork     common.ForkID
 		wantPath string
 		wantOff  int64
@@ -98,7 +98,7 @@ func TestResolveLocation(t *testing.T) {
 		},
 		{
 			name:     "page in second segment",
-			page:     common.PageID(common.MaxPagesPerSegment),
+			page:     common.BlockID(common.MaxPagesPerSegment),
 			fork:     common.ForkMain,
 			wantPath: filepath.Join(dir, "1.1"),
 			wantOff:  0,
@@ -164,7 +164,7 @@ func TestWritePageToDisk(t *testing.T) {
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
-	page := common.PageID(0)
+	page := common.BlockID(0)
 
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
 
@@ -196,7 +196,7 @@ func TestWritePageToDiskPanicsWithoutFileExisting(t *testing.T) {
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
-	page := common.PageID(0)
+	page := common.BlockID(0)
 
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
 
@@ -211,7 +211,7 @@ func TestWritePagePartialFail(t *testing.T) {
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
-	page := common.PageID(0)
+	page := common.BlockID(0)
 
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize)/2)
 
@@ -247,7 +247,7 @@ func TestWritePageOverwrite(t *testing.T) {
 func TestWritePageSegmentBoundary(t *testing.T) {
 	dm, dir := newTestDM(t, 10, 100)
 
-	page := common.PageID(common.MaxPagesPerSegment)
+	page := common.BlockID(common.MaxPagesPerSegment)
 	data := bytes.Repeat([]byte{0xDD}, int(common.PageSize))
 
 	if err := dm.WritePage(1, common.ForkMain, page, data, true); err != nil {
@@ -350,10 +350,10 @@ func TestConcurrentWriteMonotonicPages(t *testing.T) {
 	wg.Add(writers)
 
 	for i := 0; i < writers; i++ {
-		page := common.PageID(i)
+		page := common.BlockID(i)
 		data := dataArr[i]
 
-		go func(p common.PageID, d []byte) {
+		go func(p common.BlockID, d []byte) {
 			defer wg.Done()
 			if err := dm.WritePage(rel, fork, p, d, true); err != nil {
 				t.Errorf("WritePage failed for page %d: %v", p, err)
@@ -381,18 +381,18 @@ func TestConcurrentWriteMonotonicPages(t *testing.T) {
 	}
 }
 
-func TestAllocatePage(t *testing.T) {
+func TestAllocateBlock(t *testing.T) {
 	dm, _ := newTestDM(t, 10, 100)
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
 
 	for i := 0; i < 10; i++ {
-		pid, err := dm.AllocatePage(rel, fork)
+		pid, err := dm.AllocateBlock(rel, fork)
 		if err != nil {
-			t.Fatalf("AllocatePage failed: %v", err)
+			t.Fatalf("AllocateBlock failed: %v", err)
 		}
-		if pid != common.PageID(i) {
+		if pid != common.BlockID(i) {
 			t.Fatalf("expected page %d, got %d", i, pid)
 		}
 	}
@@ -405,7 +405,7 @@ func TestLRUEviction(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		rel := common.RelationID(i)
 		fork := common.ForkMain
-		_, err := dm.AllocatePage(rel, fork)
+		_, err := dm.AllocateBlock(rel, fork)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -525,7 +525,7 @@ func TestSyncPage_PersistedData(t *testing.T) {
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
-	page := common.PageID(0)
+	page := common.BlockID(0)
 
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
 
@@ -570,12 +570,12 @@ func TestAllocatePage_Basic(t *testing.T) {
 
 	// Allocate a few pages
 	for i := 0; i < 5; i++ {
-		pid, err := dm.AllocatePage(rel, fork)
+		pid, err := dm.AllocateBlock(rel, fork)
 		if err != nil {
-			t.Fatalf("AllocatePage failed: %v", err)
+			t.Fatalf("AllocateBlock failed: %v", err)
 		}
-		if pid != common.PageID(i) {
-			t.Fatalf("AllocatePage returned %d, want %d", pid, i)
+		if pid != common.BlockID(i) {
+			t.Fatalf("AllocateBlock returned %d, want %d", pid, i)
 		}
 	}
 
@@ -595,7 +595,7 @@ func TestAllocatePage_CreatesSegment(t *testing.T) {
 	rel := common.RelationID(2)
 	fork := common.ForkMain
 
-	pid, err := dm.AllocatePage(rel, fork)
+	pid, err := dm.AllocateBlock(rel, fork)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,12 +619,12 @@ func TestAllocatePage_SingleSegmentOnly(t *testing.T) {
 	n := int(common.MaxPagesPerSegment - 1)
 
 	for i := 0; i < n; i++ {
-		pid, err := dm.AllocatePage(rel, fork)
+		pid, err := dm.AllocateBlock(rel, fork)
 		if err != nil {
-			t.Fatalf("AllocatePage failed: %v", err)
+			t.Fatalf("AllocateBlock failed: %v", err)
 		}
-		if pid != common.PageID(i) {
-			t.Fatalf("pid=%d, want %d", pid, i)
+		if pid != common.BlockID(i) {
+			t.Fatalf("blockid=%d, want %d", pid, i)
 		}
 	}
 
@@ -659,26 +659,26 @@ func TestAllocatePageCreatesNewSegment(t *testing.T) {
 	data := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
 
 	// Fill first segment completely
-	for i := common.PageID(0); i < common.PageID(common.MaxPagesPerSegment); i++ {
-		page, err := dm.AllocatePage(rel, fork)
+	for i := common.BlockID(0); i < common.BlockID(common.MaxPagesPerSegment); i++ {
+		block, err := dm.AllocateBlock(rel, fork)
 		if err != nil {
-			t.Fatalf("AllocatePage failed: %v", err)
+			t.Fatalf("AllocateBlock failed: %v", err)
 		}
-		if page != i {
-			t.Fatalf("allocated page = %d, want %d", page, i)
+		if block != i {
+			t.Fatalf("Allocated block = %d, want %d", block, i)
 		}
 
-		if err := dm.WritePage(rel, fork, page, data, false); err != nil {
+		if err := dm.WritePage(rel, fork, block, data, false); err != nil {
 			t.Fatalf("WritePage failed: %v", err)
 		}
 	}
 
 	// Allocate one more page → should create segment 1
-	page, err := dm.AllocatePage(rel, fork)
+	page, err := dm.AllocateBlock(rel, fork)
 	if err != nil {
-		t.Fatalf("AllocatePage failed: %v", err)
+		t.Fatalf("AllocateBlock failed: %v", err)
 	}
-	if page != common.PageID(common.MaxPagesPerSegment) {
+	if page != common.BlockID(common.MaxPagesPerSegment) {
 		t.Fatalf("allocated page = %d, want %d", page, common.MaxPagesPerSegment)
 	}
 
@@ -693,7 +693,7 @@ func TestAllocatePageCreatesNewSegment(t *testing.T) {
 		t.Fatalf("GetNumPages failed: %v", err)
 	}
 
-	if actualCount != common.PageID(common.MaxPagesPerSegment+1) {
+	if actualCount != common.BlockID(common.MaxPagesPerSegment+1) {
 		t.Fatalf("page count = %d, want %d", actualCount, common.MaxPagesPerSegment+1)
 	}
 
@@ -728,14 +728,14 @@ func TestAllocatePageConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(workers)
 
-	results := make(chan common.PageID, workers)
+	results := make(chan common.BlockID, workers)
 
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer wg.Done()
-			page, err := dm.AllocatePage(rel, fork)
+			page, err := dm.AllocateBlock(rel, fork)
 			if err != nil {
-				t.Errorf("AllocatePage failed: %v", err)
+				t.Errorf("AllocateBlock failed: %v", err)
 				return
 			}
 			results <- page
@@ -747,7 +747,7 @@ func TestAllocatePageConcurrent(t *testing.T) {
 
 	// ---- Verify uniqueness ----
 
-	seen := make(map[common.PageID]bool)
+	seen := make(map[common.BlockID]bool)
 	for p := range results {
 		if seen[p] {
 			t.Fatalf("duplicate page ID allocated: %d", p)

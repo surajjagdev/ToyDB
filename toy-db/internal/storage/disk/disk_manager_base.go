@@ -11,12 +11,12 @@ import (
 )
 
 type DiskManager interface {
-	ReadPage(rel common.RelationID, fork common.ForkID, page common.PageID, data []byte) error
-	WritePage(rel common.RelationID, fork common.ForkID, page common.PageID, data []byte) error
-	AllocatePage(rel common.RelationID, fork common.ForkID) (common.PageID, error)
-	SyncPage(rel common.RelationID, fork common.ForkID, page common.PageID) error
+	ReadPage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte) error
+	WritePage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte) error
+	AllocateBlock(rel common.RelationID, fork common.ForkID) (common.BlockID, error)
+	SyncPage(rel common.RelationID, fork common.ForkID, page common.BlockID) error
 	SyncDir(rel common.RelationID, fork common.ForkID) error
-	GetNumPages(rel common.RelationID, fork common.ForkID) (common.PageID, error)
+	GetNumPages(rel common.RelationID, fork common.ForkID) (common.BlockID, error)
 	Shutdown() error
 }
 
@@ -26,7 +26,7 @@ type RelationFork struct {
 }
 
 type dfEntry struct {
-	count common.PageID
+	count common.BlockID
 	elem  *list.Element
 	mu    sync.Mutex
 }
@@ -85,9 +85,9 @@ func (m *ManagerBase) evictOldest() {
 }
 
 // others
-func (d *ManagerBase) loadPageCountFromDisk(rel common.RelationID, fork common.ForkID) (common.PageID, error) {
-	var totalPages common.PageID = 0
-	segment := common.PageID(0)
+func (d *ManagerBase) loadPageCountFromDisk(rel common.RelationID, fork common.ForkID) (common.BlockID, error) {
+	var totalPages common.BlockID = 0
+	segment := common.BlockID(0)
 
 	for {
 		path := d.segmentPath(rel, fork, segment)
@@ -103,7 +103,7 @@ func (d *ManagerBase) loadPageCountFromDisk(rel common.RelationID, fork common.F
 		}
 
 		size := info.Size()
-		pages := common.PageID(size / int64(common.PageSize))
+		pages := common.BlockID(size / int64(common.PageSize))
 		totalPages += pages
 
 		// If this segment is not full, it must be the last one
@@ -115,7 +115,7 @@ func (d *ManagerBase) loadPageCountFromDisk(rel common.RelationID, fork common.F
 	return totalPages, nil
 }
 
-func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (common.PageID, error) {
+func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (common.BlockID, error) {
 	rf := RelationFork{Rel: rel, Fork: fork}
 
 	// 1. Check Cache
@@ -179,7 +179,7 @@ func (m *ManagerBase) SyncDir(rel common.RelationID, fork common.ForkID) error {
 func (m *ManagerBase) segmentPath(
 	rel common.RelationID,
 	fork common.ForkID,
-	segment common.PageID,
+	segment common.BlockID,
 ) string {
 
 	base := filepath.Join(m.baseDir, fmt.Sprintf("%d", rel))
@@ -197,11 +197,11 @@ func (m *ManagerBase) segmentPath(
 func (m *ManagerBase) resolveLocation(
 	rel common.RelationID,
 	fork common.ForkID,
-	page common.PageID,
+	page common.BlockID,
 ) (string, int64) {
 
-	segment := page / common.PageID(common.MaxPagesPerSegment)
-	segPage := page % common.PageID(common.MaxPagesPerSegment)
+	segment := page / common.BlockID(common.MaxPagesPerSegment)
+	segPage := page % common.BlockID(common.MaxPagesPerSegment)
 
 	return m.segmentPath(rel, fork, segment),
 		int64(segPage) * int64(common.PageSize)

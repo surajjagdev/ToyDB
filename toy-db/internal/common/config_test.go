@@ -9,19 +9,19 @@ func TestPageSize(t *testing.T) {
 	}
 }
 
-// TestInvalidPageID tests the InvalidPageID constant
-func TestInvalidPageID(t *testing.T) {
-	var expected PageID = ^PageID(0)
-	if InvalidPageID != expected {
-		t.Fatalf("InvalidPageID = %v, want %v", InvalidPageID, expected)
+// TestInvalidBlockID tests the InvalidBlockID constant
+func TestInvalidBlockID(t *testing.T) {
+	var expected BlockID = ^BlockID(0)
+	if InvalidBlockID != expected {
+		t.Fatalf("InvalidBlockID = %v, want %v", InvalidBlockID, expected)
 	}
 }
 
-// TestMaxPageID tests the MaxPageID constant
-func TestMaxPageID(t *testing.T) {
-	var expected PageID = InvalidPageID - 1
-	if MaxPageID != expected {
-		t.Fatalf("MaxPageID = %v, want %v", MaxPageID, expected)
+// TestMaxBlockID tests the MaxBlockID constant
+func TestMaxBlockID(t *testing.T) {
+	var expected BlockID = InvalidBlockID - 1
+	if MaxBlockID != expected {
+		t.Fatalf("MaxBlockID = %v, want %v", MaxBlockID, expected)
 	}
 }
 

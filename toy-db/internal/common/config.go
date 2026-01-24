@@ -23,8 +23,8 @@ const (
 )
 
 const (
-	InvalidPageID        PageID        = PageID(^uint32(0))
-	MaxPageID            PageID        = InvalidPageID - 1
+	InvalidBlockID       BlockID       = BlockID(^uint32(0))
+	MaxBlockID           BlockID       = InvalidBlockID - 1
 	InvalidForkId        ForkID        = ^ForkID(0)
 	InvalidRelationID    RelationID    = ^RelationID(0)
 	InvalidTransactionID TransactionID = TransactionID(^uint32(0))

@@ -158,7 +158,7 @@ func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
 // Insert a single tuple into the page
 func (h *HeapPage) InsertTuple(
 	data []byte,
-	pageId common.PageID,
+	pageId common.BlockID,
 	xmin common.TransactionID,
 	cid common.CommandID,
 ) error {

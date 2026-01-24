@@ -8,7 +8,7 @@ import (
 
 const (
 	OffsetPageLSN            = 0  // 64 bit
-	OffsetPageID             = 8  // 32 bit
+	OffsetPageIDReserved     = 8  // 32 bit
 	OffsetLower              = 12 // 16 bit
 	OffsetUpper              = 14 // 16 bit
 	OffsetSpecial            = 16 // 16 bit
@@ -49,7 +49,7 @@ func InitBasePage(p Page, flags PageFlags) {
 func (p Page) ResetPage(flags PageFlags) {
 	p.zeroPageMemory()
 
-	p.SetPageId(common.InvalidPageID)
+	p.SetPageId(^uint32(0) - 1)
 
 	// LSN starts invalid / zero
 	p.SetLSN(0)
@@ -83,12 +83,12 @@ func (p Page) SetLSN(lsn common.LogSeqNumber) {
 	common.ByteOrder.PutUint64(p[OffsetPageLSN:OffsetPageLSN+8], uint64(lsn))
 }
 
-func (p Page) GetPageID() common.PageID {
-	return common.PageID(common.ByteOrder.Uint32(p[OffsetPageID : OffsetPageID+4]))
+func (p Page) getPageID() uint32 {
+	return common.ByteOrder.Uint32(p[OffsetPageIDReserved : OffsetPageIDReserved+4])
 }
 
-func (p Page) SetPageId(pageID common.PageID) {
-	common.ByteOrder.PutUint32(p[OffsetPageID:OffsetPageID+4], uint32(pageID))
+func (p Page) SetPageId(v uint32) {
+	common.ByteOrder.PutUint32(p[OffsetPageIDReserved:OffsetPageIDReserved+4], v)
 }
 
 func (p Page) GetFlags() PageFlags {

@@ -52,7 +52,7 @@ func TestTupleInsert(t *testing.T) {
 		data[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data, common.PageID(1), common.TransactionID(1), common.CommandID(0))
+	err := h.InsertTuple(data, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -91,10 +91,10 @@ func TestTupleInsert(t *testing.T) {
 		t.Fatalf("hoff mismatch: expected %d, got %d", expectedHoff, hoff)
 	}
 
-	pageId := common.ByteOrder.Uint32(tuple[TupleHeaderOffsetCtid:])
+	BlockID := common.ByteOrder.Uint32(tuple[TupleHeaderOffsetCtid:])
 	slot := common.ByteOrder.Uint16(tuple[TupleHeaderOffsetCtid+4:])
-	if pageId != 1 || slot != 0 {
-		t.Fatalf("ctid mismatch: got (%d,%d)", pageId, slot)
+	if BlockID != 1 || slot != 0 {
+		t.Fatalf("ctid mismatch: got (%d,%d)", BlockID, slot)
 	}
 
 	// descriptors not done yet
@@ -113,11 +113,11 @@ func TestTupleInsertMultiple(t *testing.T) {
 		data2[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data1, common.PageID(1), common.TransactionID(1), common.CommandID(0))
+	err := h.InsertTuple(data1, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
-	err = h.InsertTuple(data2, common.PageID(1), common.TransactionID(1), common.CommandID(1))
+	err = h.InsertTuple(data2, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -135,15 +135,15 @@ func TestTupleInsertMultiple(t *testing.T) {
 		t.Fatalf("expected tuple 1 to be smaller than tuple 2")
 	}
 
-	pageId := common.ByteOrder.Uint32(tuple1[TupleHeaderOffsetCtid:])
+	BlockID := common.ByteOrder.Uint32(tuple1[TupleHeaderOffsetCtid:])
 	slot := common.ByteOrder.Uint16(tuple1[TupleHeaderOffsetCtid+4:])
-	pageId2 := common.ByteOrder.Uint32(tuple2[TupleHeaderOffsetCtid:])
+	BlockID2 := common.ByteOrder.Uint32(tuple2[TupleHeaderOffsetCtid:])
 	slot2 := common.ByteOrder.Uint16(tuple2[TupleHeaderOffsetCtid+4:])
-	if pageId != 1 || slot != 0 {
-		t.Fatalf("ctid mismatch: got (%d,%d)", pageId, slot)
+	if BlockID != 1 || slot != 0 {
+		t.Fatalf("ctid mismatch: got (%d,%d)", BlockID, slot)
 	}
-	if pageId2 != 1 || slot2 != 1 {
-		t.Fatalf("ctid mismatch: got (%d,%d)", pageId, slot)
+	if BlockID2 != 1 || slot2 != 1 {
+		t.Fatalf("ctid mismatch: got (%d,%d)", BlockID, slot)
 	}
 }
 
@@ -160,11 +160,11 @@ func TestTupleInsertMultipleAndDelete(t *testing.T) {
 		data2[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data1, common.PageID(1), common.TransactionID(1), common.CommandID(0))
+	err := h.InsertTuple(data1, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
-	err = h.InsertTuple(data2, common.PageID(1), common.TransactionID(1), common.CommandID(1))
+	err = h.InsertTuple(data2, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -224,7 +224,7 @@ func TestValidateSlotOffset(t *testing.T) {
 
 	initialFreeSpace := h.GetFreeSpace()
 
-	h.InsertTuple(data, common.PageID(0), common.MaxTransactionID-1, common.MaxCommandID-1)
+	h.InsertTuple(data, common.BlockID(0), common.MaxTransactionID-1, common.MaxCommandID-1)
 
 	newFreeSpace := h.GetFreeSpace()
 

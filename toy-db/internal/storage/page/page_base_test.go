@@ -52,10 +52,10 @@ func TestLSNReadWrite(t *testing.T) {
 func TestPageIDReadWrite(t *testing.T) {
 	p := newTestPage(t)
 
-	id := common.PageID(12345)
+	id := uint32(12345)
 	p.SetPageId(id)
 
-	if got := p.GetPageID(); got != id {
+	if got := p.getPageID(); got != id {
 		t.Fatalf("PageID = %d, want %d", got, id)
 	}
 }
@@ -79,13 +79,13 @@ func TestPageVersionReadWrite(t *testing.T) {
 func TestPageIDAndLSNReadWrite(t *testing.T) {
 	p := newTestPage(t)
 
-	id := common.PageID(12345)
+	id := uint32(12345)
 	lsn := common.LogSeqNumber(99999)
 
 	p.SetPageId(id)
 	p.SetLSN(lsn)
 
-	if got := p.GetPageID(); got != id {
+	if got := p.getPageID(); got != id {
 		t.Fatalf("PageID = %d, want %d", got, id)
 	}
 	if got := p.GetLSN(); got != lsn {
@@ -212,7 +212,7 @@ func TestCheckSumTakesHeadersAndData(t *testing.T) {
 	p := newTestPage(t)
 
 	p.SetLSN(common.InvalidLogSeqNumber / 2)
-	p.SetPageId(common.MaxPageID / 2)
+	p.SetPageId((^uint32(0) - 1) / 2)
 	p.SetFlags(PageFlagDeleted)
 	p.SetSpecial(0xA)
 	p.SetLower(PageHeaderSize)
@@ -226,7 +226,7 @@ func TestCheckSumTakesHeadersAndData(t *testing.T) {
 	}
 
 	// Modify header without recomputing checksum
-	p.SetPageId((common.MaxPageID / 2) - 1)
+	p.SetPageId(((^uint32(0) - 1) / 2) - 1)
 
 	if p.ValidateIntegrity() {
 		t.Fatal("checksum should fail after header modification")

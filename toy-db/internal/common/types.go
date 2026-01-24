@@ -6,9 +6,9 @@ import "encoding/binary"
 // not for storing on disk (disk doesnt need to know)
 var ByteOrder = binary.LittleEndian
 
-// Page Id is a u32 (4 bytes) number.
+// Block Id is a u32 (4 bytes) number.
 // Defined in: internal/common/types.go
-type PageID uint32
+type BlockID uint32
 
 // Relation identifies a table, index, etc  in the db.
 // uniquely identify a page

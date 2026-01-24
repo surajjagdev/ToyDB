@@ -29,7 +29,7 @@ func NewDirectManager(
 	}, nil
 }
 
-func (d *DirectManager) ReadPage(rel common.RelationID, fork common.ForkID, page common.PageID, data []byte) error {
+func (d *DirectManager) ReadPage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte) error {
 	// get path
 	path, offset := d.resolveLocation(rel, fork, page)
 
@@ -67,7 +67,7 @@ func (d *DirectManager) ReadPage(rel common.RelationID, fork common.ForkID, page
 	return nil
 }
 
-func (d *DirectManager) WritePage(rel common.RelationID, fork common.ForkID, page common.PageID, data []byte, allowCreate bool) error {
+func (d *DirectManager) WritePage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte, allowCreate bool) error {
 	// check if correct page size
 	if len(data) != int(common.PageSize) {
 		return fmt.Errorf("buffer size %d != PageSize %d", len(data), common.PageSize)
@@ -125,7 +125,7 @@ func (d *DirectManager) WritePage(rel common.RelationID, fork common.ForkID, pag
 	return nil
 }
 
-func (d *DirectManager) AllocatePage(rel common.RelationID, fork common.ForkID) (common.PageID, error) {
+func (d *DirectManager) AllocateBlock(rel common.RelationID, fork common.ForkID) (common.BlockID, error) {
 	rf := RelationFork{Rel: rel, Fork: fork}
 
 	// 1. init page count
@@ -139,7 +139,7 @@ func (d *DirectManager) AllocatePage(rel common.RelationID, fork common.ForkID) 
 
 		if err != nil {
 			d.countMu.Unlock()
-			return common.InvalidPageID, err
+			return common.InvalidBlockID, err
 		}
 		df = &dfEntry{count: actualCount}
 		d.pageCount[rf] = df
@@ -149,13 +149,13 @@ func (d *DirectManager) AllocatePage(rel common.RelationID, fork common.ForkID) 
 
 	// 2. Allocate page size
 	df.mu.Lock()
-	pageID := df.count
+	BlockID := df.count
 	df.count++
 	df.mu.Unlock()
 
 	// do we need new segment ?
-	if pageID%common.PageID(common.MaxPagesPerSegment) == 0 {
-		segment := pageID / common.PageID(common.MaxPagesPerSegment)
+	if BlockID%common.BlockID(common.MaxPagesPerSegment) == 0 {
+		segment := BlockID / common.BlockID(common.MaxPagesPerSegment)
 		path := d.segmentPath(rel, fork, segment)
 		flags := os.O_RDWR | os.O_CREATE
 
@@ -165,18 +165,18 @@ func (d *DirectManager) AllocatePage(rel common.RelationID, fork common.ForkID) 
 		)
 
 		if err != nil {
-			// Fatal disk error: do NOT roll back pageID
-			return common.InvalidPageID, fmt.Errorf("failed to create segment file: %w", err)
+			// Fatal disk error: do NOT roll back BlockID
+			return common.InvalidBlockID, fmt.Errorf("failed to create segment file: %w", err)
 		}
 		d.vfd.Release(entry)
 	}
 
 	d.touchEntry(rf, df)
 
-	return pageID, nil
+	return BlockID, nil
 }
 
-func (m *DirectManager) SyncPage(rel common.RelationID, fork common.ForkID, page common.PageID) error {
+func (m *DirectManager) SyncPage(rel common.RelationID, fork common.ForkID, page common.BlockID) error {
 	path, _ := m.resolveLocation(rel, fork, page)
 
 	entry, err := m.vfd.GetOrOpen(FileNode{Path: path}, os.O_RDWR)

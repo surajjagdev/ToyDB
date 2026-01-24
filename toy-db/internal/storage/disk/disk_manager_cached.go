@@ -32,7 +32,7 @@ func NewCachedManager(
 func (d *CachedManager) ReadPage(
 	rel common.RelationID,
 	fork common.ForkID,
-	page common.PageID,
+	page common.BlockID,
 	data []byte) error {
 	// verify data is same as page size
 	if len(data) != int(common.PageSize) {
@@ -75,7 +75,7 @@ func (d *CachedManager) ReadPage(
 func (d *CachedManager) WritePage(
 	rel common.RelationID,
 	fork common.ForkID,
-	page common.PageID,
+	page common.BlockID,
 	data []byte,
 	allowCreate bool, // for testing, in practice should be false
 ) error {
@@ -137,7 +137,7 @@ func (d *CachedManager) WritePage(
 	return nil
 }
 
-func (d *CachedManager) AllocatePage(rel common.RelationID, fork common.ForkID) (common.PageID, error) {
+func (d *CachedManager) AllocateBlock(rel common.RelationID, fork common.ForkID) (common.BlockID, error) {
 	rf := RelationFork{Rel: rel, Fork: fork}
 
 	// 1. init page count
@@ -151,7 +151,7 @@ func (d *CachedManager) AllocatePage(rel common.RelationID, fork common.ForkID) 
 
 		if err != nil {
 			d.countMu.Unlock()
-			return common.InvalidPageID, err
+			return common.InvalidBlockID, err
 		}
 		df = &dfEntry{count: actualCount}
 		d.pageCount[rf] = df
@@ -161,13 +161,13 @@ func (d *CachedManager) AllocatePage(rel common.RelationID, fork common.ForkID) 
 
 	// 2. Allocate page size
 	df.mu.Lock()
-	pageID := df.count
+	BlockID := df.count
 	df.count++
 	df.mu.Unlock()
 
 	// do we need new segment ?
-	if pageID%common.PageID(common.MaxPagesPerSegment) == 0 {
-		segment := pageID / common.PageID(common.MaxPagesPerSegment)
+	if BlockID%common.BlockID(common.MaxPagesPerSegment) == 0 {
+		segment := BlockID / common.BlockID(common.MaxPagesPerSegment)
 		path := d.segmentPath(rel, fork, segment)
 		flags := os.O_RDWR | os.O_CREATE
 
@@ -177,18 +177,18 @@ func (d *CachedManager) AllocatePage(rel common.RelationID, fork common.ForkID) 
 		)
 
 		if err != nil {
-			// Fatal disk error: do NOT roll back pageID
-			return common.InvalidPageID, fmt.Errorf("failed to create segment file: %w", err)
+			// Fatal disk error: do NOT roll back BlockID
+			return common.InvalidBlockID, fmt.Errorf("failed to create segment file: %w", err)
 		}
 		d.vfd.Release(entry)
 	}
 
 	d.touchEntry(rf, df)
 
-	return pageID, nil
+	return BlockID, nil
 }
 
-func (m *CachedManager) SyncPage(rel common.RelationID, fork common.ForkID, page common.PageID) error {
+func (m *CachedManager) SyncPage(rel common.RelationID, fork common.ForkID, page common.BlockID) error {
 	path, _ := m.resolveLocation(rel, fork, page)
 	entry, err := m.vfd.GetOrOpen(FileNode{Path: path}, os.O_RDWR)
 	if err != nil {

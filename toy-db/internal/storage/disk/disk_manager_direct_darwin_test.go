@@ -23,7 +23,7 @@ func TestDirectManager_WriteReadPage(t *testing.T) {
 
 	relID := common.RelationID(1)
 	forkID := common.ForkMain
-	pageID := common.PageID(0)
+	BlockID := common.BlockID(0)
 
 	// Prepare buffer
 	data := make([]byte, common.PageSize)
@@ -32,13 +32,13 @@ func TestDirectManager_WriteReadPage(t *testing.T) {
 	}
 
 	// Write page
-	if err := dm.WritePage(relID, forkID, pageID, data, true); err != nil {
+	if err := dm.WritePage(relID, forkID, BlockID, data, true); err != nil {
 		t.Fatalf("WritePage failed: %v", err)
 	}
 
 	// Read back
 	readBuf := make([]byte, common.PageSize)
-	if err := dm.ReadPage(relID, forkID, pageID, readBuf); err != nil {
+	if err := dm.ReadPage(relID, forkID, BlockID, readBuf); err != nil {
 		t.Fatalf("ReadPage failed: %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestDirectManagerWriteFailsWithoutAllocation(t *testing.T) {
 
 	rel := common.RelationID(1)
 	fork := common.ForkMain
-	pid := common.PageID(0)
+	pid := common.BlockID(0)
 
 	// write page
 	// Prepare buffer
@@ -77,10 +77,10 @@ func TestDirectManager_FileCreated(t *testing.T) {
 
 	relID := common.RelationID(1)
 	forkID := common.ForkMain
-	pageID := common.PageID(0)
+	BlockID := common.BlockID(0)
 
 	data := make([]byte, common.PageSize)
-	if err := dm.WritePage(relID, forkID, pageID, data, true); err != nil {
+	if err := dm.WritePage(relID, forkID, BlockID, data, true); err != nil {
 		t.Fatalf("WritePage failed: %v", err)
 	}
 
@@ -98,26 +98,26 @@ func TestDirectManager_MultiplePages(t *testing.T) {
 	relID := common.RelationID(2)
 	forkID := common.ForkMain
 
-	for pageID := common.PageID(0); pageID < 5; pageID++ {
+	for BlockID := common.BlockID(0); BlockID < 5; BlockID++ {
 		data := make([]byte, common.PageSize)
-		data[0] = byte(pageID)
-		if err := dm.WritePage(relID, forkID, pageID, data, true); err != nil {
-			t.Fatalf("WritePage %d failed: %v", pageID, err)
+		data[0] = byte(BlockID)
+		if err := dm.WritePage(relID, forkID, BlockID, data, true); err != nil {
+			t.Fatalf("WritePage %d failed: %v", BlockID, err)
 		}
 	}
 
-	for pageID := common.PageID(0); pageID < 5; pageID++ {
+	for BlockID := common.BlockID(0); BlockID < 5; BlockID++ {
 		readBuf := make([]byte, common.PageSize)
-		if err := dm.ReadPage(relID, forkID, pageID, readBuf); err != nil {
-			t.Fatalf("ReadPage %d failed: %v", pageID, err)
+		if err := dm.ReadPage(relID, forkID, BlockID, readBuf); err != nil {
+			t.Fatalf("ReadPage %d failed: %v", BlockID, err)
 		}
-		if readBuf[0] != byte(pageID) {
-			t.Fatalf("Read data mismatch for page %d", pageID)
+		if readBuf[0] != byte(BlockID) {
+			t.Fatalf("Read data mismatch for page %d", BlockID)
 		}
 	}
 }
 
-func TestDirectManagerAllocatePage(t *testing.T) {
+func TestDirectManagerAllocateBlock(t *testing.T) {
 	tmpDir := t.TempDir()
 	dm, _ := NewDirectManager(tmpDir, 10, 10)
 
@@ -125,12 +125,12 @@ func TestDirectManagerAllocatePage(t *testing.T) {
 	fork := common.ForkMain
 
 	for i := 0; i < 10; i++ {
-		pid, err := dm.AllocatePage(rel, fork)
+		pid, err := dm.AllocateBlock(rel, fork)
 		if err != nil {
-			t.Fatalf("AllocatePage failed: %v", err)
+			t.Fatalf("AllocateBlock failed: %v", err)
 		}
-		if pid != common.PageID(i) {
-			t.Fatalf("expected page %d, got %d", i, pid)
+		if pid != common.BlockID(i) {
+			t.Fatalf("expected block id %d, got %d", i, pid)
 		}
 	}
 }
@@ -142,10 +142,10 @@ func TestDirectManagerFsync(t *testing.T) {
 	rel := common.RelationID(1)
 	fork := common.ForkMain
 
-	pid, err := dm.AllocatePage(rel, fork)
+	pid, err := dm.AllocateBlock(rel, fork)
 
 	if err != nil {
-		t.Fatalf("AllocatePage failed: %v", err)
+		t.Fatalf("AllocateBlock failed: %v", err)
 	}
 
 	// write page
