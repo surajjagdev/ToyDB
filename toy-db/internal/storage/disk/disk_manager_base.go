@@ -15,7 +15,6 @@ type DiskManager interface {
 	WritePage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte) error
 	AllocateBlock(rel common.RelationID, fork common.ForkID) (common.BlockID, error)
 	SyncPage(rel common.RelationID, fork common.ForkID, page common.BlockID) error
-	SyncDir(rel common.RelationID, fork common.ForkID) error
 	GetNumPages(rel common.RelationID, fork common.ForkID) (common.BlockID, error)
 	Shutdown() error
 }

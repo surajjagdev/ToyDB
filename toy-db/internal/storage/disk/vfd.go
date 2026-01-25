@@ -122,7 +122,7 @@ func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
 		}
 
 		if !hasEvicted {
-			return nil, fmt.Errorf("failed to evict any enteries for %s", fn.Path)
+			return nil, fmt.Errorf("failed to evict any entries for %s", fn.Path)
 		}
 	}
 

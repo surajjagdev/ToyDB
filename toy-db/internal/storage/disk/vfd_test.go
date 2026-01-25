@@ -64,7 +64,7 @@ func TestGetOrOpen_NewFile(t *testing.T) {
 		t.Fatal("file is nil")
 	}
 	if entry.refCount != 1 {
-		t.Errorf("refCount = %d, want 0", entry.refCount)
+		t.Errorf("refCount = %d, want 1", entry.refCount)
 	}
 	if cache.lruList.Len() != 1 {
 		t.Errorf("lruList length = %d, want 1", cache.lruList.Len())
@@ -326,7 +326,7 @@ func TestEvictOne_AllHaveRefCount(t *testing.T) {
 	fn3 := newTempFileNode(t, dir, "test3.txt")
 	entry3, err := cache.GetOrOpen(fn3, os.O_RDWR|os.O_CREATE)
 	if err == nil {
-		t.Fatalf("GetOrOpen failed: %v", err)
+		t.Fatalf("expected error when all entries have refCount > 0: %v", err)
 	}
 
 	// Verify all files are still open
@@ -336,15 +336,12 @@ func TestEvictOne_AllHaveRefCount(t *testing.T) {
 	if _, err := entry2.file.Stat(); err != nil {
 		t.Errorf("file2 should still be open: %v", err)
 	}
-	if entry3 == nil || entry3.file == nil {
-		t.Error("file3 should exist in cache")
-	} else if _, err := entry3.file.Stat(); err != nil {
-		t.Errorf("file3 should still be open: %v", err)
+	if entry3 != nil {
+		t.Error("file3 should not exist in cache")
 	}
 
-	// Cache should have 3 entries even though capacity is 2
-	if cache.lruList.Len() != 3 {
-		t.Errorf("lruList length = %d, want 3 (can exceed capacity when all have refCount > 0)", cache.lruList.Len())
+	if cache.lruList.Len() != 2 {
+		t.Errorf("lruList length = %d, want 2", cache.lruList.Len())
 	}
 }
 
