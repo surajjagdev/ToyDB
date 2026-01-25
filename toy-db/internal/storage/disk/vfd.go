@@ -39,6 +39,10 @@ type VFDCache struct {
 }
 
 func NewCachedVFD(capacity int) *VFDCache {
+	if capacity <= 0 {
+		panic("VFD capacity must be > 0")
+	}
+
 	return &VFDCache{
 		capacity: capacity,
 		cache:    make(map[FileNode]*vfdEntry),
@@ -59,13 +63,13 @@ func NewDirectVFD(capacity int) *VFDCache {
 }
 
 // evict least recently used element
-func (v *VFDCache) evictOne() error {
+func (v *VFDCache) evictOne() (error, bool) {
 	// evict the first entry that is not used
 	lastElement := v.lruList.Back()
 
 	for {
 		if lastElement == nil {
-			return nil
+			return nil, false
 		}
 
 		entry := lastElement.Value.(*vfdEntry)
@@ -78,7 +82,7 @@ func (v *VFDCache) evictOne() error {
 		// close the os file
 		if entry.file != nil {
 			if err := entry.file.Close(); err != nil {
-				return err
+				return err, false
 			}
 		}
 
@@ -88,7 +92,7 @@ func (v *VFDCache) evictOne() error {
 		delete(v.cache, entry.fileNode)
 
 		// entry in cache can remain
-		return nil
+		return nil, true
 	}
 }
 
@@ -110,9 +114,15 @@ func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
 
 	// evict if exceeds capacity
 	if v.lruList.Len() >= v.capacity {
-		// evict
-		if err := v.evictOne(); err != nil {
+
+		err, hasEvicted := v.evictOne()
+
+		if err != nil {
 			return nil, err
+		}
+
+		if !hasEvicted {
+			return nil, fmt.Errorf("failed to evict any enteries for %s", fn.Path)
 		}
 	}
 

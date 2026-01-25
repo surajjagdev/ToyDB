@@ -28,7 +28,6 @@ type RelationFork struct {
 type dfEntry struct {
 	count common.BlockID
 	elem  *list.Element
-	mu    sync.Mutex
 }
 
 type ManagerBase struct {
@@ -42,6 +41,10 @@ type ManagerBase struct {
 }
 
 func newManagerBase(baseDir string, maxCachedRelations int) *ManagerBase {
+	if maxCachedRelations <= 0 {
+		panic("ManagerBase: maxCachedRelations must be > 0")
+	}
+
 	return &ManagerBase{
 		baseDir:    baseDir,
 		pageCount:  make(map[RelationFork]*dfEntry),
@@ -54,21 +57,22 @@ func newManagerBase(baseDir string, maxCachedRelations int) *ManagerBase {
 // LRU helpers
 // -----------------------------------------------------------------------------
 
-func (m *ManagerBase) touchEntry(rf RelationFork, e *dfEntry) {
-	m.countMu.Lock()
-	defer m.countMu.Unlock()
+// assumes lock in higher order function
+func (m *ManagerBase) touchEntry(rf RelationFork) {
+	if e, ok := m.pageCount[rf]; ok {
+		if e.elem != nil {
+			m.lruList.MoveToFront(e.elem)
+		} else {
+			e.elem = m.lruList.PushFront(rf)
+		}
 
-	if e.elem != nil {
-		m.lruList.MoveToFront(e.elem)
-	} else {
-		e.elem = m.lruList.PushFront(rf)
-	}
-
-	if m.lruList.Len() > m.maxEntries {
-		m.evictOldest()
+		if m.lruList.Len() > m.maxEntries {
+			m.evictOldest()
+		}
 	}
 }
 
+// assumes lock in higher order function
 func (m *ManagerBase) evictOldest() {
 	back := m.lruList.Back()
 	if back == nil {
@@ -103,6 +107,11 @@ func (d *ManagerBase) loadPageCountFromDisk(rel common.RelationID, fork common.F
 		}
 
 		size := info.Size()
+
+		if size%int64(common.PageSize) != 0 {
+			return 0, fmt.Errorf("corrupt segment %s", path)
+		}
+
 		pages := common.BlockID(size / int64(common.PageSize))
 		totalPages += pages
 
@@ -115,17 +124,20 @@ func (d *ManagerBase) loadPageCountFromDisk(rel common.RelationID, fork common.F
 	return totalPages, nil
 }
 
+// pageCount is a read-through cache only.
+// Eviction is good bc the source of truth is disk always.
 func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (common.BlockID, error) {
 	rf := RelationFork{Rel: rel, Fork: fork}
 
 	// 1. Check Cache
 	d.countMu.Lock()
-	df, exists := d.pageCount[rf]
 
-	if exists {
+	if df, exists := d.pageCount[rf]; exists {
+		d.touchEntry(rf)
+		count := df.count
 		d.countMu.Unlock()
-		d.touchEntry(rf, df)
-		return df.count, nil
+
+		return count, nil
 	}
 
 	d.countMu.Unlock()
@@ -141,15 +153,20 @@ func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (co
 	d.countMu.Lock()
 
 	// check if someone else populated
-	if existingDF, ok := d.pageCount[rf]; ok {
+	if df, ok := d.pageCount[rf]; ok {
+		d.touchEntry(rf)
+		count := df.count
 		d.countMu.Unlock()
-		existingDF.mu.Lock()
-		defer existingDF.mu.Unlock()
-		return existingDF.count, nil
+		return count, nil
 	}
 
-	newDf := &dfEntry{count: actualCount}
-	d.pageCount[rf] = newDf
+	df := &dfEntry{count: actualCount}
+	df.elem = d.lruList.PushFront(rf)
+	d.pageCount[rf] = df
+
+	if d.lruList.Len() > d.maxEntries {
+		d.evictOldest()
+	}
 	d.countMu.Unlock()
 
 	return actualCount, nil

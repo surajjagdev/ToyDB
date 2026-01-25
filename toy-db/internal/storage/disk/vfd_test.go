@@ -325,7 +325,7 @@ func TestEvictOne_AllHaveRefCount(t *testing.T) {
 	// Try to add a third file - should not evict any (all have refCount > 0)
 	fn3 := newTempFileNode(t, dir, "test3.txt")
 	entry3, err := cache.GetOrOpen(fn3, os.O_RDWR|os.O_CREATE)
-	if err != nil {
+	if err == nil {
 		t.Fatalf("GetOrOpen failed: %v", err)
 	}
 

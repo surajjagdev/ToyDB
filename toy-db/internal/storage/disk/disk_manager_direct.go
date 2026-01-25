@@ -58,11 +58,10 @@ func (d *DirectManager) ReadPage(rel common.RelationID, fork common.ForkID, page
 	// update LRU
 	rf := RelationFork{Rel: rel, Fork: fork}
 	d.countMu.Lock()
-	df, exists := d.pageCount[rf]
-	d.countMu.Unlock()
-	if exists {
-		d.touchEntry(rf, df)
+	if _, exists := d.pageCount[rf]; exists {
+		d.touchEntry(rf)
 	}
+	d.countMu.Unlock()
 
 	return nil
 }
@@ -103,6 +102,7 @@ func (d *DirectManager) WritePage(rel common.RelationID, fork common.ForkID, pag
 	rf := RelationFork{Rel: rel, Fork: fork}
 	d.countMu.Lock()
 	df, exists := d.pageCount[rf]
+
 	if !exists {
 		actualCount, err := d.loadPageCountFromDisk(rel, fork)
 		if err != nil {
@@ -112,15 +112,14 @@ func (d *DirectManager) WritePage(rel common.RelationID, fork common.ForkID, pag
 		df = &dfEntry{count: actualCount}
 		d.pageCount[rf] = df
 	}
-	d.countMu.Unlock()
 
-	df.mu.Lock()
 	if page >= df.count {
 		df.count = page + 1
 	}
-	df.mu.Unlock()
 
-	d.touchEntry(rf, df)
+	d.touchEntry(rf)
+
+	d.countMu.Unlock()
 
 	return nil
 }
@@ -145,35 +144,23 @@ func (d *DirectManager) AllocateBlock(rel common.RelationID, fork common.ForkID)
 		d.pageCount[rf] = df
 	}
 
+	// 2. Allocate page size
+	blockId := df.count
+	df.count++
+	d.touchEntry(rf)
 	d.countMu.Unlock()
 
-	// 2. Allocate page size
-	df.mu.Lock()
-	BlockID := df.count
-	df.count++
-	df.mu.Unlock()
-
 	// do we need new segment ?
-	if BlockID%common.BlockID(common.MaxPagesPerSegment) == 0 {
-		segment := BlockID / common.BlockID(common.MaxPagesPerSegment)
-		path := d.segmentPath(rel, fork, segment)
-		flags := os.O_RDWR | os.O_CREATE
-
-		entry, err := d.vfd.GetOrOpen(
-			FileNode{Path: path},
-			flags,
-		)
-
-		if err != nil {
-			// Fatal disk error: do NOT roll back BlockID
-			return common.InvalidBlockID, fmt.Errorf("failed to create segment file: %w", err)
-		}
-		d.vfd.Release(entry)
+	segment := blockId / common.BlockID(common.MaxPagesPerSegment)
+	path := d.segmentPath(rel, fork, segment)
+	entry, err := d.vfd.GetOrOpen(FileNode{Path: path}, os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		return common.InvalidBlockID, fmt.Errorf("failed to create segment: %w", err)
 	}
 
-	d.touchEntry(rf, df)
+	d.vfd.Release(entry)
 
-	return BlockID, nil
+	return blockId, nil
 }
 
 func (m *DirectManager) SyncPage(rel common.RelationID, fork common.ForkID, page common.BlockID) error {
