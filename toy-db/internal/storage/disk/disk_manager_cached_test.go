@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -191,6 +192,104 @@ func TestWritePageToDisk(t *testing.T) {
 	}
 }
 
+func TestWritePageToDisk_MultipleRelationsSequential(t *testing.T) {
+	dm, dir := newTestDM(t, 10, 100)
+
+	rel1 := common.RelationID(1)
+	rel2 := common.RelationID(2)
+	fork := common.ForkMain
+	page := common.BlockID(0)
+
+	data1 := bytes.Repeat([]byte{0xAB}, int(common.PageSize))
+	data2 := bytes.Repeat([]byte{0xAC}, int(common.PageSize))
+
+	// Write page
+	if err := dm.WritePage(rel1, fork, page, data1, true); err != nil {
+		t.Fatalf("WritePage to %v failed: %v", rel1, err)
+	}
+	if err := dm.WritePage(rel2, fork, page, data2, true); err != nil {
+		t.Fatalf("WritePage to %v failed: %v", rel2, err)
+	}
+
+	// Force data to disk
+	if err := dm.vfd.CloseAll(false); err != nil {
+		t.Fatalf("failed to close files: %v", err)
+	}
+
+	path1 := filepath.Join(dir, "1")
+	path2 := filepath.Join(dir, "2")
+
+	if _, err := os.Stat(path1); err != nil {
+		t.Fatalf("expected data file to exist: %v", err)
+	}
+	if _, err := os.Stat(path2); err != nil {
+		t.Fatalf("expected data file to exist: %v", err)
+	}
+
+	onDisk1 := readPageFromDisk(t, path1, 0)
+	onDisk2 := readPageFromDisk(t, path2, 0)
+
+	if !bytes.Equal(data1, onDisk1) {
+		t.Fatal("data on disk does not match written data")
+	}
+	if !bytes.Equal(data2, onDisk2) {
+		t.Fatal("data on disk does not match written data")
+	}
+}
+
+func TestWritePageToDisk_MultipleRelationsConcurrent(t *testing.T) {
+	dm, dir := newTestDM(t, 10, 100)
+
+	relationCount := 10
+
+	var wg sync.WaitGroup
+	wg.Add(relationCount)
+	errCh := make(chan error, relationCount)
+
+	bytesArr := [10][]byte{}
+
+	for i := 0; i < relationCount; i++ {
+		rel := common.RelationID(i)
+		fork := common.ForkMain
+		page := common.BlockID(0)
+
+		bytesArr[i] = bytes.Repeat([]byte{byte(i)}, int(common.PageSize))
+
+		go func(r common.RelationID, f common.ForkID, p common.BlockID, d []byte) {
+			defer wg.Done()
+			var err error
+			if err = dm.WritePage(r, f, p, d, true); err != nil {
+				errCh <- fmt.Errorf("WritePage to %v: %w", r, err)
+				return
+			}
+			errCh <- nil
+		}(rel, fork, page, bytesArr[i])
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+	}
+
+	for i := 0; i < relationCount; i++ {
+		path := filepath.Join(dir, strconv.Itoa(i))
+
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected data file to exist: %v", err)
+		}
+
+		onDisk := readPageFromDisk(t, path, 0)
+
+		if !bytes.Equal(bytesArr[i], onDisk) {
+			t.Fatalf("data on disk does not match written data at index %d", i)
+		}
+	}
+}
+
 func TestWritePageToDiskPanicsWithoutFileExisting(t *testing.T) {
 	dm, _ := newTestDM(t, 10, 100)
 
@@ -332,24 +431,26 @@ func TestConcurrentWriteMonotonicPages(t *testing.T) {
 	// Each entry is one page-sized byte slice
 	dataArr := make([][]byte, writers)
 
-	for i := 0; i < writers; i++ {
-		// Fill each page with a unique byte pattern
-		dataArr[i] = bytes.Repeat([]byte{byte(i)}, int(common.PageSize))
-	}
-
 	var wg sync.WaitGroup
 	wg.Add(writers)
 
 	for i := 0; i < writers; i++ {
-		page := common.BlockID(i)
-		data := dataArr[i]
-
-		go func(p common.BlockID, d []byte) {
+		go func(idx int) {
 			defer wg.Done()
-			if err := dm.WritePage(rel, fork, p, d, true); err != nil {
-				t.Errorf("WritePage failed for page %d: %v", p, err)
+
+			// allocate a page
+			blockId, err := dm.AllocateBlock(rel, fork)
+
+			if err != nil {
+				t.Errorf("Failed to allocate a block %v", err)
 			}
-		}(page, data)
+
+			dataArr[int(blockId)] = bytes.Repeat([]byte{byte(idx)}, int(common.PageSize))
+
+			if err := dm.WritePage(rel, fork, blockId, dataArr[int(blockId)], true); err != nil {
+				t.Errorf("WritePage failed for block %d: %v", blockId, err)
+			}
+		}(i)
 	}
 
 	wg.Wait()
