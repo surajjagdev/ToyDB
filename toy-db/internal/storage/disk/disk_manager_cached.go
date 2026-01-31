@@ -65,6 +65,11 @@ func (d *CachedManager) ReadPage(
 	d.countMu.Lock()
 	if _, exists := d.pageCount[rf]; exists {
 		d.touchEntry(rf)
+	} else {
+		// warm the cache
+		newDf := &dfEntry{count: common.InvalidBlockID}
+		d.pageCount[rf] = newDf
+		d.touchEntry(rf)
 	}
 	d.countMu.Unlock()
 
@@ -115,24 +120,43 @@ func (d *CachedManager) WritePage(
 
 	d.countMu.Lock()
 	df, exists := d.pageCount[rf]
+	needsLoadFromDisk := !exists || df.count == common.InvalidBlockID
+	d.countMu.Unlock()
 
-	if !exists {
+	// if we didnt have a cached page count, or count is lazily invalid, get accurate
+	// page count from disk and cache it
+	if needsLoadFromDisk {
 		actualCount, err := d.loadPageCountFromDisk(rel, fork)
 		if err != nil {
-			d.countMu.Unlock()
 			return err
 		}
-		df = &dfEntry{count: actualCount}
-		d.pageCount[rf] = df
+
+		d.countMu.Lock()
+		// re-check after load
+		df, exists = d.pageCount[rf]
+		if !exists {
+			df = &dfEntry{count: actualCount}
+			df.elem = d.lruList.PushFront(rf)
+			d.pageCount[rf] = df
+		} else if df.count == common.InvalidBlockID {
+			df.count = actualCount
+		}
+		d.countMu.Unlock()
 	}
 
-	if page >= df.count {
-		df.count = page + 1
+	d.countMu.Lock()
+	defer d.countMu.Unlock()
+
+	writeAllowed := checkSequentialWrite(page, df.count)
+
+	if writeAllowed == SPARSE_WRITE {
+		// already wrote to page in memory, so higher order methods have to handle it
+		return fmt.Errorf("sparse write forbidden: page=%d, numPages=%d", page, df.count)
+	} else if writeAllowed == NEW_WRITE {
+		df.count++
 	}
 
 	d.touchEntry(rf)
-
-	d.countMu.Unlock()
 
 	return nil
 }
