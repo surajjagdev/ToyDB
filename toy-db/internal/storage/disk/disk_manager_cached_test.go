@@ -244,23 +244,14 @@ func TestWritePageOverwrite(t *testing.T) {
 	}
 }
 
-func TestWritePageSegmentBoundary(t *testing.T) {
-	dm, dir := newTestDM(t, 10, 100)
+func TestWritePageSparse(t *testing.T) {
+	dm, _ := newTestDM(t, 10, 100)
 
 	page := common.BlockID(common.MaxPagesPerSegment)
 	data := bytes.Repeat([]byte{0xDD}, int(common.PageSize))
 
-	if err := dm.WritePage(1, common.ForkMain, page, data, true); err != nil {
-		t.Fatal(err)
-	}
-
-	_ = dm.vfd.CloseAll(false)
-
-	path := filepath.Join(dir, "1.1")
-	onDisk := readPageFromDisk(t, path, 0)
-
-	if !bytes.Equal(data, onDisk) {
-		t.Fatal("segment boundary write incorrect")
+	if err := dm.WritePage(1, common.ForkMain, page, data, true); err == nil {
+		t.Fatal("expected error got success for write sparse pages")
 	}
 }
 
@@ -457,7 +448,7 @@ func TestGetNumPages_CachedAndDisk(t *testing.T) {
 	}
 
 	// Write another page
-	if err := dm.WritePage(rel, fork, 2, data, true); err != nil {
+	if err := dm.WritePage(rel, fork, 1, data, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -466,8 +457,8 @@ func TestGetNumPages_CachedAndDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if num != 3 {
-		t.Fatalf("expected 3 pages after writing page 2, got %d", num)
+	if num != 2 {
+		t.Fatalf("expected 2 page after writing page, got %d", num)
 	}
 
 	// Check LRU touched
