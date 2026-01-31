@@ -39,6 +39,14 @@ type ManagerBase struct {
 	countMu sync.Mutex
 }
 
+type CHECKED_WRITE int
+
+const (
+	OVER_WRITE CHECKED_WRITE = iota
+	NEW_WRITE
+	SPARSE_WRITE
+)
+
 func newManagerBase(baseDir string, maxCachedRelations int) *ManagerBase {
 	if maxCachedRelations <= 0 {
 		panic("ManagerBase: maxCachedRelations must be > 0")
@@ -131,14 +139,15 @@ func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (co
 	// 1. Check Cache
 	d.countMu.Lock()
 
-	if df, exists := d.pageCount[rf]; exists {
+	// check that page count exists and is valid
+	if df, exists := d.pageCount[rf]; exists && df.count != common.InvalidBlockID {
 		d.touchEntry(rf)
 		count := df.count
 		d.countMu.Unlock()
-
 		return count, nil
 	}
 
+	// page count didnt exist or invalid
 	d.countMu.Unlock()
 
 	// load count from disk
@@ -153,12 +162,19 @@ func (d *ManagerBase) GetNumPages(rel common.RelationID, fork common.ForkID) (co
 
 	// check if someone else populated
 	if df, ok := d.pageCount[rf]; ok {
+		// someone (read page) may have populated, so check if
+		// count is invalid
+		if df.count == common.InvalidBlockID {
+			df.count = actualCount
+		}
+
 		d.touchEntry(rf)
 		count := df.count
 		d.countMu.Unlock()
 		return count, nil
 	}
 
+	// add new entry
 	df := &dfEntry{count: actualCount}
 	df.elem = d.lruList.PushFront(rf)
 	d.pageCount[rf] = df
@@ -221,4 +237,15 @@ func (m *ManagerBase) resolveLocation(
 
 	return m.segmentPath(rel, fork, segment),
 		int64(segPage) * int64(common.PageSize)
+}
+
+// Check if write is allowed
+func checkSequentialWrite(block common.BlockID, currentCount common.BlockID) CHECKED_WRITE {
+	if block < currentCount {
+		return OVER_WRITE
+	} else if block == currentCount {
+		return NEW_WRITE
+	} else {
+		return SPARSE_WRITE
+	}
 }
