@@ -32,7 +32,7 @@ const (
 	PageFlagBits = 3
 
 	// ---- usage count (clock sweep) ----
-	UsageBits  = 4 // 0–15
+	UsageBits  = 4 // 0–15 max val
 	UsageShift = PinCountBits + PageFlagBits
 	UsageMask  = uint32((1<<UsageBits)-1) << UsageShift
 )
@@ -117,6 +117,12 @@ func (f *Frame) CopyDataToExistingFrame(dst *Frame) {
 	dst.WLatch()
 	defer dst.WUnlatch()
 	copy(dst.Page[:common.PageSize], f.Page)
+}
+
+// Helper function to get the frame identity
+// used for testing. No locks are acquired.
+func (f *Frame) GetFrameIdentity() (common.BlockID, common.ForkID, common.RelationID) {
+	return f.BlockID, f.ForkID, f.RelationID
 }
 
 // Set the page identity
