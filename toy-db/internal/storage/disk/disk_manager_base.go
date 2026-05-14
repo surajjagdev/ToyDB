@@ -12,7 +12,7 @@ import (
 
 type DiskManager interface {
 	ReadPage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte) error
-	WritePage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte) error
+	WritePage(rel common.RelationID, fork common.ForkID, page common.BlockID, data []byte, allowCreate bool) error
 	AllocateBlock(rel common.RelationID, fork common.ForkID) (common.BlockID, error)
 	SyncPage(rel common.RelationID, fork common.ForkID, page common.BlockID) error
 	GetNumPages(rel common.RelationID, fork common.ForkID) (common.BlockID, error)
