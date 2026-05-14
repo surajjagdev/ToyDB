@@ -66,7 +66,7 @@ func TestBufferPool_RealDisk_HitMiss(t *testing.T) {
 	if !frame1.IsPinned() {
 		t.Errorf("Expected frame to be pinned")
 	}
-	if !fromCache {
+	if fromCache {
 		t.Errorf("Expected cache miss")
 	}
 
