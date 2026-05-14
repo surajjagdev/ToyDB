@@ -37,20 +37,29 @@ const (
 	UsageMask  = uint32((1<<UsageBits)-1) << UsageShift
 )
 
-// Page struct, OS-independent
-type Frame struct {
-	// block id + fork id + relation id uniquely identifies a page
+type BufferTag struct {
 	BlockID    common.BlockID
 	ForkID     common.ForkID
 	RelationID common.RelationID
+}
+
+// Page struct, OS-independent
+type Frame struct {
+	// block id + fork id + relation id uniquely identifies a page
+	bufferTag BufferTag
 
 	Page page.Page // data for the page
 
-	rwLatch sync.RWMutex // latch for the page data, not the frame itself
+	rwLatch sync.RWMutex // latch for the page data and multiple data together
 
 	// keep as uint32 to read as atomic if needed
 	// (lower ) pin count | dirty | valid | io | usage
 	state uint32
+
+	// mutex just for setting/unsetting io state
+	ioMu sync.Mutex
+
+	ioCond *sync.Cond
 
 	ptr unsafe.Pointer // only used on Linux for aligned pages
 }
@@ -62,14 +71,21 @@ func NewFrame() (*Frame, error) {
 		return nil, err
 	}
 
-	return &Frame{
-		BlockID:    common.InvalidBlockID,
-		ForkID:     common.InvalidForkID,
-		RelationID: common.InvalidRelationID,
-		Page:       page.Page(data), // cast []byte → page.Page
-		ptr:        ptr,
-		state:      uint32(0),
-	}, nil
+	frame := Frame{
+		rwLatch: sync.RWMutex{},
+		bufferTag: BufferTag{
+			BlockID:    common.InvalidBlockID,
+			ForkID:     common.InvalidForkID,
+			RelationID: common.InvalidRelationID,
+		},
+		Page:  page.Page(data), // cast []byte → page.Page
+		ptr:   ptr,
+		state: uint32(0),
+	}
+
+	frame.ioCond = sync.NewCond(&frame.ioMu)
+
+	return &frame, nil
 }
 
 // Free the frame and the page data
@@ -121,8 +137,8 @@ func (f *Frame) CopyDataToExistingFrame(dst *Frame) {
 
 // Helper function to get the frame identity
 // used for testing. No locks are acquired.
-func (f *Frame) GetFrameIdentity() (common.BlockID, common.ForkID, common.RelationID) {
-	return f.BlockID, f.ForkID, f.RelationID
+func (f *Frame) GetFrameIdentity() BufferTag {
+	return f.bufferTag
 }
 
 // Set the page identity
@@ -134,9 +150,11 @@ func (f *Frame) SetFrameIdentity(blockId common.BlockID, forkId common.ForkID, r
 		panic("Setting identity on pinned frame")
 	}
 
-	f.RelationID = rel
-	f.BlockID = blockId
-	f.ForkID = forkId
+	f.bufferTag = BufferTag{
+		BlockID:    blockId,
+		ForkID:     forkId,
+		RelationID: rel,
+	}
 }
 
 // Returns pin count
@@ -167,13 +185,16 @@ func (f *Frame) IsPinned() bool {
 
 // Pin the frame, add 1 to pin count
 // atomic op
-func (f *Frame) Pin() {
+func (f *Frame) Pin() bool {
 	for {
 		old := atomic.LoadUint32(&f.state)
 		pins := old & PinCountMask
+		if pins == PinCountMask {
+			panic("pin count overflow")
+		}
 		newState := (old & ^PinCountMask) | (pins + 1)
 		if atomic.CompareAndSwapUint32(&f.state, old, newState) {
-			return
+			return true
 		}
 	}
 }
@@ -184,13 +205,35 @@ func (f *Frame) Pin() {
 func (f *Frame) Unpin() {
 	for {
 		old := atomic.LoadUint32(&f.state)
-		pins := old & PinCountMask
-		if pins == 0 {
+		if (old & PinCountMask) == 0 {
 			panic("unpin on zero pin count")
 		}
+		// REMOVE the PageFlagIO panic check here too!
+		// It's normal to unpin an invalid frame if IO failed.
+
+		pins := old & PinCountMask
 		newState := (old & ^PinCountMask) | (pins - 1)
 		if atomic.CompareAndSwapUint32(&f.state, old, newState) {
 			return
+		}
+	}
+}
+
+func (f *Frame) TryStartIO() bool {
+	for {
+		old := atomic.LoadUint32(&f.state)
+
+		// already in IO → cannot claim
+		if (old & PageFlagIO) != 0 {
+			return false
+		}
+
+		newState := old | PageFlagIO
+
+		// try to claim IO
+		if atomic.CompareAndSwapUint32(&f.state, old, newState) {
+			// wake waiters if needed (optional safety for WaitIO loops)
+			return true
 		}
 	}
 }
@@ -213,7 +256,7 @@ func (f *Frame) GetUsage() uint32 {
 	return (state & UsageMask) >> UsageShift
 }
 
-// IncrementUsage increases usage count (max 15)
+// IncrementUsage increases usage count (max 15) - For clock sweeps
 func (f *Frame) IncrementUsage() {
 	for {
 		old := atomic.LoadUint32(&f.state)
@@ -228,7 +271,7 @@ func (f *Frame) IncrementUsage() {
 	}
 }
 
-// DecrementUsage decreases usage count (min 0)
+// DecrementUsage decreases usage count (min 0) - For clock
 func (f *Frame) DecrementUsage() {
 	for {
 		old := atomic.LoadUint32(&f.state)
@@ -261,12 +304,35 @@ func (f *Frame) IsIOInProgress() bool {
 	return (state & PageFlagIO) != 0
 }
 
-func (f *Frame) SetIOInProgress() {
+func (f *Frame) setIOInProgress() {
 	atomic.OrUint32(&f.state, uint32(PageFlagIO))
 }
 
-func (f *Frame) ClearIOInProgress() {
+func (f *Frame) clearIOInProgress() {
 	atomic.AndUint32(&f.state, ^uint32(PageFlagIO))
+}
+
+// public method to change to starting io, so we can broadcast signal
+func (f *Frame) StartIO() {
+	f.ioMu.Lock()
+	f.setIOInProgress()
+	f.ioMu.Unlock()
+}
+
+func (f *Frame) StopIO() {
+	f.ioMu.Lock()
+	f.clearIOInProgress()
+	// broadcast that the ioi progress has been cleared
+	f.ioCond.Broadcast()
+	f.ioMu.Unlock()
+}
+
+func (f *Frame) WaitIO() {
+	f.ioMu.Lock()
+	for f.IsIOInProgress() {
+		f.ioCond.Wait()
+	}
+	f.ioMu.Unlock()
 }
 
 // -----------------------------------------------------------------------------

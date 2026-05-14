@@ -3,6 +3,7 @@ package buffer
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 )
@@ -13,7 +14,9 @@ func GetNewFrame(t *testing.T) *Frame {
 		t.Fatalf("failed to create frame: %v", err)
 	}
 
-	blockId, forkId, relId := frame.GetFrameIdentity()
+	bufferTag := frame.GetFrameIdentity()
+
+	blockId, forkId, relId := bufferTag.BlockID, bufferTag.ForkID, bufferTag.RelationID
 	if blockId != common.InvalidBlockID {
 		t.Fatalf("block id = %d, want %d", blockId, common.InvalidBlockID)
 	}
@@ -38,7 +41,9 @@ func TestSettingFrameIdentity(t *testing.T) {
 
 	frame.SetFrameIdentity(expectedBlock, expectedFork, expectedRel)
 
-	blockId, forkId, relId := frame.GetFrameIdentity()
+	bufferTag := frame.GetFrameIdentity()
+
+	blockId, forkId, relId := bufferTag.BlockID, bufferTag.ForkID, bufferTag.RelationID
 
 	if blockId != expectedBlock {
 		t.Fatalf("block id = %d, want %d", blockId, expectedBlock)
@@ -197,14 +202,116 @@ func TestIOFlag(t *testing.T) {
 	frame := GetNewFrame(t)
 	defer frame.Free()
 
-	frame.SetIOInProgress()
+	frame.setIOInProgress()
 	if !frame.IsIOInProgress() {
 		t.Fatal("expected IO in progress")
 	}
 
-	frame.ClearIOInProgress()
+	frame.clearIOInProgress()
 	if frame.IsIOInProgress() {
 		t.Fatal("expected IO cleared")
+	}
+}
+
+func TestStartIOSetsInProgress(t *testing.T) {
+	frame := GetNewFrame(t)
+	defer frame.Free()
+
+	frame.StartIO()
+
+	if !frame.IsIOInProgress() {
+		t.Fatal("expected IO in progress")
+	}
+}
+
+func TestTryStartIO(t *testing.T) {
+	frame := GetNewFrame(t)
+	defer frame.Free()
+
+	if !frame.TryStartIO() {
+		t.Fatal("expected false")
+	}
+}
+
+func TestTryStartIOMultipleTimes(t *testing.T) {
+	frame := GetNewFrame(t)
+	defer frame.Free()
+
+	if !frame.TryStartIO() {
+		t.Fatal("expected true")
+	}
+
+	if frame.TryStartIO() {
+		t.Fatal("expected false")
+	}
+}
+
+func TestStopIOUnsetsInProgress(t *testing.T) {
+	frame := GetNewFrame(t)
+	defer frame.Free()
+
+	frame.StartIO()
+
+	if !frame.IsIOInProgress() {
+		t.Fatal("expected IO in progress")
+	}
+
+	frame.StopIO()
+
+	if frame.IsIOInProgress() {
+		t.Fatal("expected IO to not be in progress")
+	}
+}
+
+func TestFrameWaitIONoBlock(t *testing.T) {
+	frame, err := NewFrame()
+	if err != nil {
+		t.Fatalf("failed to create frame: %v", err)
+	}
+
+	start := time.Now()
+	frame.WaitIO()
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Millisecond {
+		t.Fatalf("WaitIO took too long with no IO in progress")
+	}
+}
+
+func TestSingleFrameWaiters(t *testing.T) {
+	frame, err := NewFrame()
+	if err != nil {
+		t.Fatalf("failed to create frame: %v", err)
+	}
+
+	defer frame.Free()
+
+	frame.StartIO()
+
+	numWaiting := 5
+	done := make(chan bool, numWaiting)
+	defer close(done)
+
+	for i := 0; i < numWaiting; i++ {
+		go func() {
+			frame.WaitIO()
+			done <- true
+		}()
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	frame.StopIO()
+
+	timeout := time.After(200 * time.Millisecond)
+
+	for i := 0; i < numWaiting; i++ {
+		select {
+		case <-done:
+			// done
+		case <-timeout:
+			t.Fatalf("not all waiters resumed")
+		}
 	}
 }
 
@@ -245,7 +352,7 @@ func TestResetClearsState(t *testing.T) {
 	frame.Pin()
 	frame.SetDirty()
 	frame.SetValid()
-	frame.SetIOInProgress()
+	frame.setIOInProgress()
 	frame.IncrementUsage()
 
 	frame.Reset(0)
