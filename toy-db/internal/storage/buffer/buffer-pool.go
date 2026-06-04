@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
@@ -30,13 +32,13 @@ type FramePartition struct {
 
 // we hold a number of different frame partitions
 type BufferPool struct {
-	mu sync.Mutex // lock for buffer pool, is not used unless needed
-
 	diskManager disk.DiskManager
 
 	numPartitions common.PartitionIndex // number of partitions in the buffer pool
 
 	partitions []*FramePartition
+
+	isShuttingDown atomic.Bool
 }
 
 func NewFramePartition(numFrames common.FrameIndex) (*FramePartition, error) {
@@ -85,33 +87,26 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 	}
 
 	return &BufferPool{
-		diskManager:   diskManager,
-		numPartitions: numPartitions,
-		partitions:    partitions,
+		diskManager:    diskManager,
+		numPartitions:  numPartitions,
+		partitions:     partitions,
+		isShuttingDown: atomic.Bool{},
 	}, nil
 }
 
-func (bp *BufferPool) Shutdown() error {
-	bp.mu.Lock()
-
-	defer bp.mu.Unlock()
-
-	for _, partition := range bp.partitions {
-		func(p *FramePartition) {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-
-			for _, frame := range p.frames {
-				// TODO: if frame.IsDirty() { flush to disk }
-				frame.Free()
-			}
-		}(partition)
-	}
-
-	return bp.diskManager.Shutdown()
-}
-
 // Internal methods
+
+// Assume you have a write lock on the frame
+// Write the page out to disk
+func (bp *BufferPool) writePageOut(frame *Frame) error {
+	return bp.diskManager.WritePage(
+		frame.GetFrameIdentity().RelationID,
+		frame.GetFrameIdentity().ForkID,
+		frame.GetFrameIdentity().BlockID,
+		frame.Page,
+		false,
+	)
+}
 
 // From internet, seems to be a good hash function for this use case
 // Given buffer tag, get a consistient index to the frame partition in buffer pool
@@ -244,13 +239,7 @@ func (bp *BufferPool) evictFrame(framePartition common.PartitionIndex) (*Frame, 
 	if frame.IsDirty() && frame.IsValid() {
 		fp.mu.Unlock()
 
-		err := bp.diskManager.WritePage(
-			tag.RelationID,
-			tag.ForkID,
-			tag.BlockID,
-			frame.Page,
-			false,
-		)
+		err := bp.writePageOut(frame)
 
 		fp.mu.Lock()
 
@@ -308,6 +297,9 @@ func (bp *BufferPool) getPageFromCache(framePartition *FramePartition, tag Buffe
 // We need to get a page by its tag and load into a frame. If it already exists,
 // great. otherwise we will need to load from disk
 func (bp *BufferPool) GetPage(tag BufferTag) (*Frame, error, bool) {
+	if bp.isShuttingDown.Load() {
+		return nil, fmt.Errorf("buffer pool is shutting down"), false
+	}
 
 	partitionIdx := bp.getPartitionIndex(tag)
 	framePartition := bp.partitions[partitionIdx]
@@ -412,4 +404,81 @@ retry:
 	frame.SetValid()
 
 	return frame, nil, false
+}
+
+func (bp *BufferPool) GracefulShutdown(timeout time.Duration) error {
+	bp.isShuttingDown.Store(true)
+	// wait for active pins to drop to 0, or timeout
+	deadline := time.Now().Add(timeout)
+
+	for {
+		allUnpinned := true
+
+		// Check every frame in every partition
+		for _, partition := range bp.partitions {
+			partition.mu.RLock()
+			for _, frame := range partition.frames {
+				if frame.IsPinned() {
+					allUnpinned = false
+					break
+				}
+			}
+			partition.mu.RUnlock()
+
+			if !allUnpinned {
+				break // skip other partitions in this loop
+			}
+		}
+
+		if allUnpinned {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("graceful shutdown timed out: active queries refused to unpin frames")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return bp.Shutdown()
+}
+
+// This is a hard shutdown, no graceful shutdown
+func (bp *BufferPool) Shutdown() error {
+	var firstErr error
+
+	for _, partition := range bp.partitions {
+		func(p *FramePartition) {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+
+			for _, frame := range p.frames {
+				// 1. Only flush if the frame actually holds valid data and was modified
+				if frame.IsValid() && frame.IsDirty() {
+					tag := frame.GetFrameIdentity()
+
+					// 2. Write page out, expected that page exists on disk
+					err := bp.writePageOut(frame)
+
+					// 3. Record the first error we see, but keep going!
+					if err != nil && firstErr == nil {
+						firstErr = fmt.Errorf("failed to flush page %v during shutdown: %w", tag, err)
+					}
+				}
+
+				// 4. Free the physical OS memory
+				frame.Free()
+			}
+		}(partition)
+	}
+
+	// 5. Shut down the disk manager (closes all VFD OS files)
+	diskErr := bp.diskManager.Shutdown()
+
+	// 6. Return errors if any occurred
+	if firstErr != nil {
+		return firstErr
+	}
+	return diskErr
 }

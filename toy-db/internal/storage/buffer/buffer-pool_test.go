@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
@@ -206,5 +207,125 @@ func TestMultipleReadersSameFrameShouldOnlyInvokeOneDiskRead(t *testing.T) {
 			workersLen-1,
 			got,
 		)
+	}
+}
+
+func TestBufferPool_GracefulShutdownSavesToDisk(t *testing.T) {
+	// Tiny buffer pool: 1 partition, 1 frame total
+	bp, dm := setupBufferPool(t, 1, 1)
+
+	rel := common.RelationID(2)
+	fork := common.ForkID(0)
+
+	// write 1 block on disk
+	b1, err := dm.AllocateBlock(rel, fork)
+	if err != nil {
+		t.Fatalf("Failed to allocate block: %v", err)
+	}
+	writePage(t, dm, rel, fork, b1)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+
+	// 1. Fill the pool (FIX: GetPage only returns frame and error)
+	f1, err, _ := bp.GetPage(tag1)
+	if err != nil {
+		t.Fatalf("Failed to GetPage: %v", err)
+	}
+
+	// 2. Modify frame 1
+	f1.WLatch()
+	copy(f1.Page, []byte("Direct IO Flush Test"))
+	f1.SetDirty()
+	f1.WUnlatch()
+
+	// 3. Unpin so it can be safely flushed during shutdown
+	f1.Unpin()
+
+	// 4. Graceful shutdown
+	err = bp.GracefulShutdown(10 * time.Second)
+	if err != nil {
+		// No need to call bp.Shutdown() here, GracefulShutdown already attempts it
+		t.Fatalf("Failed to graceful shutdown: %v", err)
+	}
+
+	time.Sleep(10 * time.Second) // wait for the page to be flushed
+
+	// 5. Verify the page made it to the disk
+	verifyBuf, ptr, err := allocPageData()
+	if err != nil {
+		t.Fatalf("Failed to alloc verify buffer: %v", err)
+	}
+	defer freePageData(ptr)
+
+	// Note: GracefulShutdown closed all the files in the VFD cache.
+	// However, because of your excellent VFD design, calling ReadPage here
+	// will simply cause the VFD to safely reopen the file descriptor!
+	err = dm.ReadPage(rel, fork, b1, verifyBuf) // FIX: Removed page.Page() cast
+	if err != nil {
+		t.Fatalf("Direct disk read failed: %v", err)
+	}
+
+	if !bytes.HasPrefix(verifyBuf, []byte("Direct IO Flush Test")) {
+		t.Errorf("Flushed data did not match expected bytes on disk")
+	}
+}
+
+func TestBufferPool_GracefulShutdownDoesNotAllNewRequests(t *testing.T) {
+	// Tiny buffer pool: 1 partition, 1 frame total
+	bp, dm := setupBufferPool(t, 1, 1)
+
+	rel := common.RelationID(2)
+	fork := common.ForkID(0)
+
+	// write 1 block on disk
+	b1, err := dm.AllocateBlock(rel, fork)
+	if err != nil {
+		t.Fatalf("Failed to allocate block: %v", err)
+	}
+	writePage(t, dm, rel, fork, b1)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+
+	// 1. Fill the pool (FIX: GetPage only returns frame and error)
+	f1, err, _ := bp.GetPage(tag1)
+	if err != nil {
+		t.Fatalf("Failed to GetPage: %v", err)
+	}
+
+	// 2. mod frame 1
+	f1.WLatch()
+	copy(f1.Page, []byte("Direct IO Flush Test"))
+	f1.SetDirty()
+	f1.WUnlatch()
+
+	// 3. Unpin so it can be safely flushed during shutdown
+	f1.Unpin()
+
+	// 4. Graceful shutdown
+	err = bp.GracefulShutdown(10 * time.Second)
+	if err != nil {
+		t.Fatalf("Failed to graceful shutdown: %v", err)
+	}
+
+	_, err, _ = bp.GetPage(tag1)
+	if err == nil {
+		t.Fatalf("expected error for reading after shutdown")
+	}
+
+	time.Sleep(10 * time.Second) // wait for the page to be flushed
+
+	// 5. Verify the page made it to the disk
+	verifyBuf, ptr, err := allocPageData()
+	if err != nil {
+		t.Fatalf("Failed to alloc verify buffer: %v", err)
+	}
+	defer freePageData(ptr)
+	err = dm.ReadPage(rel, fork, b1, verifyBuf)
+	if err != nil {
+		t.Fatalf("Direct disk read failed: %v", err)
+	}
+
+	if !bytes.HasPrefix(verifyBuf, []byte("Direct IO Flush Test")) {
+		t.Errorf("Flushed data did not match expected bytes on disk")
 	}
 }
