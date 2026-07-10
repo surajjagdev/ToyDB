@@ -48,6 +48,20 @@ test-darwin:
 	@echo "Running Darwin tests..."
 	GOOS=darwin GOARCH=amd64 $(GO) test -tags=darwin -v $(TEST_DIR)
 
+test-native:
+	@echo "Running all tests with GO..."
+	$(GO) test $(TEST_DIR)
+
+# Run native tests with the Race Detector enabled to catch concurrency bugs
+test-race:
+	@echo "Running all tests with Race Detector..."
+	$(GO) test -race -v $(TEST_DIR)
+
+# Run native tests 10 times in a row with the Race Detector to catch rare timing bugs
+test-stress-native:
+	@echo "Stress testing concurrency (running all tests 10 times)..."
+	$(GO) test -race -count=10 -v $(TEST_DIR)
+
 # ----------------------------
 # Clean
 # ----------------------------
