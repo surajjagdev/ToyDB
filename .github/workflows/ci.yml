@@ -23,7 +23,7 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Run Regular Tests (All Branches)
+    - name: Run Regular Tests (All Branches).
       run: make test-native
 
     - name: Run Concurrency Stress Tests (PRs Only)
