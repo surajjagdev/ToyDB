@@ -23,9 +23,6 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Build
-      run: make build
-
     - name: Run Regular Tests (All Branches)
       run: make test-native
 
