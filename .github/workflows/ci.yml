@@ -1,0 +1,34 @@
+name: ToyDB CI Pipeline
+
+on:
+  # Run on ALL branches whenever a push happens
+  push:
+    branches: [ "**" ]
+  
+  # Run on Pull Requests targeting the main branch
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22' 
+
+    - name: Build
+      run: make build
+
+    - name: Run Regular Tests (All Branches)
+      # This runs on every single push to any branch
+      run: make test-native
+
+    - name: Run Concurrency Stress Tests (PRs Only)
+      # This step ONLY triggers if the event is a Pull Request
+      if: github.event_name == 'pull_request'
+      run: make test-stress-native
