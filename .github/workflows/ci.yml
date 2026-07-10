@@ -12,6 +12,11 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+
+  defaults:
+    run:
+      working-directory: ./toy-db
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
