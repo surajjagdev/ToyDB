@@ -24,15 +24,15 @@ all: build
 
 build:
 	@echo "Building for current OS..."
-	$(GO) build $(BUILD_FLAGS) -o $(BINARY) ./cmd/toydb
+	$(GO) build $(BUILD_FLAGS) -o $(BINARY) 
 
 linux:
 	@echo "Building for Linux..."
-	GOOS=linux GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(BINARY)_linux ./cmd/toydb
+	GOOS=linux GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(BINARY)_linux 
 
 darwin:
 	@echo "Building for macOS... $(UNAME)"
-	GOOS=darwin GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(BINARY)_darwin ./cmd/toydb
+	GOOS=darwin GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(BINARY)_darwin 
 
 # ----------------------------
 # Test targets
