@@ -2,6 +2,7 @@ package buffer
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -327,5 +328,218 @@ func TestBufferPool_GracefulShutdownDoesNotAllNewRequests(t *testing.T) {
 
 	if !bytes.HasPrefix(verifyBuf, []byte("Direct IO Flush Test")) {
 		t.Errorf("Flushed data did not match expected bytes on disk")
+	}
+}
+
+func TestBufferPool_FlushSinglePage(t *testing.T) {
+	// Tiny buffer pool: 1 partition, 1 frames total
+	bp, dm := setupBufferPool(t, 1, 1)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(0)
+	fork := common.ForkID(0)
+
+	// write 1 block on disk
+	b1, _ := dm.AllocateBlock(rel, fork)
+
+	writePage(t, dm, rel, fork, b1)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+
+	// Fill the pool
+	f1, _, _ := bp.GetPage(tag1)
+
+	// Modify frame 1
+	f1.WLatch()
+	copy(f1.Page, []byte("Write some data to the frame"))
+	f1.SetDirty()
+	f1.WUnlatch()
+
+	// Unpin
+	f1.Unpin()
+
+	// flush page
+	err := bp.FlushPage(tag1)
+	if err != nil {
+		t.Fatalf("Failed to flush page: %v", err)
+	}
+	// verify page is not dirty
+	if f1.IsDirty() {
+		t.Errorf("Frame should not be dirty after flush")
+	}
+
+	verifyBuf, ptr, err := allocPageData()
+	if err != nil {
+		t.Fatalf("Failed to alloc verify buffer: %v", err)
+	}
+	defer freePageData(ptr)
+
+	err = dm.ReadPage(rel, fork, b1, page.Page(verifyBuf))
+	if err != nil {
+		t.Fatalf("Direct disk read failed: %v", err)
+	}
+
+	if !bytes.HasPrefix(verifyBuf, []byte("Write some data to the frame")) {
+		t.Errorf("Flushed data did not match expected bytes on disk")
+	}
+}
+
+func TestBufferPool_FlushAllPagesSingleDirtyPage(t *testing.T) {
+	// Tiny buffer pool: 1 partition, 1 frames total
+	bp, dm := setupBufferPool(t, 1, 1)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(0)
+	fork := common.ForkID(0)
+
+	// write 1 block on disk
+	b1, _ := dm.AllocateBlock(rel, fork)
+
+	writePage(t, dm, rel, fork, b1)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+
+	// Fill the pool
+	f1, _, _ := bp.GetPage(tag1)
+
+	// Modify frame 1
+	f1.WLatch()
+	copy(f1.Page, []byte("Write some data to the frame"))
+	f1.SetDirty()
+	f1.WUnlatch()
+
+	// Unpin
+	f1.Unpin()
+
+	// flush page
+	err := bp.FlushAllPages()
+	if err != nil {
+		t.Fatalf("Failed to flush page: %v", err)
+	}
+
+	// verify page is not dirty
+	if f1.IsDirty() {
+		t.Errorf("Frame should not be dirty after flush")
+	}
+
+	verifyBuf, ptr, err := allocPageData()
+	if err != nil {
+		t.Fatalf("Failed to alloc verify buffer: %v", err)
+	}
+
+	defer freePageData(ptr)
+
+	err = dm.ReadPage(rel, fork, b1, page.Page(verifyBuf))
+	if err != nil {
+		t.Fatalf("Direct disk read failed: %v", err)
+	}
+
+	if !bytes.HasPrefix(verifyBuf, []byte("Write some data to the frame")) {
+		t.Errorf("Flushed data did not match expected bytes on disk")
+	}
+}
+
+func TestBufferPool_FlushAllPages_Concurrent(t *testing.T) {
+	// Buffer pool with 4 partitions, 4 frames each (16 frames total)
+	bp, dm := setupBufferPool(t, 4, 4)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(99)
+	fork := common.ForkID(0)
+	numBlocks := 10 // Less than total frames so we get cache hits, but enough to spread out
+
+	// 1. Allocate blocks on disk
+	var blocks []common.BlockID
+	for range numBlocks {
+		b, err := dm.AllocateBlock(rel, fork)
+		if err != nil {
+			t.Fatalf("Failed to allocate block: %v", err)
+		}
+		blocks = append(blocks, b)
+
+		// FIX: Tell the BufferPool to initialize this new page in memory
+		// without trying to read it from the empty disk file!
+		tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b}
+		frame, err := bp.AllocatePage(tag)
+		if err != nil {
+			t.Fatalf("Failed to allocate page in buffer pool: %v", err)
+		}
+
+		// We just needed to initialize it. Let it go so the concurrent writers can use it.
+		// AllocatePage automatically marked it dirty, so if it gets evicted, it will physically write to disk!
+		frame.Unpin()
+	}
+
+	var wg sync.WaitGroup
+	numWriters := 20
+	iterationsPerWriter := 50
+
+	// 2. Start Concurrent Writers
+	// These threads constantly fetch pages, dirty them, and unpin them.
+	for i := range numWriters {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			for j := 0; j < iterationsPerWriter; j++ {
+				// Pick a block deterministically but spread out
+				blockID := blocks[(writerID+j)%numBlocks]
+				tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: blockID}
+
+				frame, err, _ := bp.GetPage(tag)
+				if err != nil {
+					t.Errorf("Writer failed to GetPage: %v", err)
+					return
+				}
+
+				// Modify the page safely
+				frame.WLatch()
+				expectedStr := fmt.Sprintf("Data for Block %d", blockID)
+				copy(frame.Page, []byte(expectedStr))
+				frame.SetDirty()
+				frame.WUnlatch()
+
+				// Unpin it so the background flusher can grab it
+				frame.Unpin()
+
+				// Tiny sleep to force interleaving
+				time.Sleep(1 * time.Microsecond)
+			}
+		}(i)
+	}
+
+	// 3. Start Concurrent Flusher (Simulates Checkpointer / WAL)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 10 {
+			time.Sleep(2 * time.Millisecond) // Wait for writers to dirty some pages
+
+			err := bp.FlushAllPages()
+			if err != nil {
+				t.Errorf("FlushAllPages failed concurrently: %v", err)
+			}
+		}
+	}()
+
+	// 4. Wait for all threads to finish their chaos
+	wg.Wait()
+
+	// 5. Verify the physical disk contents directly
+	verifyBuf, ptr, err := allocPageData() // Must be aligned for DirectIO!
+	if err != nil {
+		t.Fatalf("Failed to alloc verify buffer: %v", err)
+	}
+	defer freePageData(ptr)
+
+	for _, blockID := range blocks {
+		err = dm.ReadPage(rel, fork, blockID, page.Page(verifyBuf))
+		if err != nil {
+			t.Fatalf("Direct disk read failed for block %d: %v", blockID, err)
+		}
+
+		expectedStr := fmt.Appendf(nil, "Data for Block %d", blockID)
+		if !bytes.HasPrefix(verifyBuf, expectedStr) {
+			t.Errorf("Block %d on disk did not match. Expected prefix: %s", blockID, string(expectedStr))
+		}
 	}
 }

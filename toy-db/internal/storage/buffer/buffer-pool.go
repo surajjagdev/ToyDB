@@ -482,3 +482,171 @@ func (bp *BufferPool) Shutdown() error {
 	}
 	return diskErr
 }
+
+// Allocate page
+func (bp *BufferPool) AllocatePage(tag BufferTag) (*Frame, error) {
+	// 1. Check if buffer pool is active
+	if bp.isShuttingDown.Load() {
+		return nil, fmt.Errorf("buffer pool is shutting down")
+	}
+
+	// 2. Get the partition idx
+	partionId := bp.getPartitionIndex(tag)
+	framePartition := bp.partitions[partionId]
+
+	// Lock partition
+	framePartition.mu.Lock()
+
+	// 1. Double check: Make sure it's not somehow already in memory
+	if _, ok := framePartition.frameMap[tag]; ok {
+		framePartition.mu.Unlock()
+		return nil, fmt.Errorf("page already exists in buffer pool")
+	}
+
+	frame, _, frameIdx, err := bp.evictFrame(partionId)
+	if err != nil {
+		framePartition.mu.Unlock()
+		return nil, err
+	}
+
+	// 3. Initialize the frame for the new block
+	frame.WLatch()
+	frame.SetFrameIdentity(tag.BlockID, tag.ForkID, tag.RelationID)
+	frame.Page.ResetPage(0)
+	frame.WUnlatch()
+
+	if !frame.Pin() {
+		framePartition.mu.Unlock()
+		return nil, fmt.Errorf("failed to pin newly allocated frame")
+	}
+
+	frame.IncrementUsage()
+	frame.SetValid()
+	frame.SetDirty() // set dirty so its written to disk
+
+	// Add to map
+	framePartition.frameMap[tag] = frameIdx
+	framePartition.mu.Unlock()
+
+	frame.StopIO()
+
+	return frame, nil
+}
+
+// Flush Single Page
+func (bp *BufferPool) FlushPage(tag BufferTag) error {
+	// 1. get frame partition
+	partitionIdx := bp.getPartitionIndex(tag)
+	framePartition := bp.partitions[partitionIdx]
+
+	// 2. lock frame partition
+	framePartition.mu.Lock()
+
+	// check if frame is in frame partition
+	frameIdx, ok := framePartition.frameMap[tag]
+
+	if !ok {
+		framePartition.mu.Unlock()
+		return nil // nothing to do, page not in buffer pool
+	}
+
+	// frame exists, check if dirty
+	frame := framePartition.frames[frameIdx]
+
+	if !frame.IsDirty() {
+		framePartition.mu.Unlock()
+		return nil // nothing to do, frame not dirty
+	}
+
+	// pin the frame
+	if !frame.Pin() {
+		framePartition.mu.Unlock()
+		return fmt.Errorf("failed to pin frame")
+	}
+
+	// unlock the frame partition
+	framePartition.mu.Unlock()
+
+	// wait for IO to complete
+	frame.WaitIO()
+	frame.StartIO()
+
+	var err error = nil
+
+	if frame.IsDirty() {
+		err = bp.writePageOut(frame)
+
+		if err == nil {
+			frame.ClearDirty()
+		}
+	}
+
+	// release io and unpin
+	frame.StopIO()
+	frame.Unpin()
+
+	return err
+}
+
+// Flush all pages in the buffer pool
+func (bp *BufferPool) FlushAllPages() error {
+	var firstError error = nil
+
+	// Loop through all partitions,
+	// lock partition and check every frame in partition
+	// if frame is dirty, if so write to disk
+	for i := common.PartitionIndex(0); i < bp.numPartitions; i++ {
+		framePartition := bp.partitions[i]
+		framePartition.mu.RLock()
+
+		for _, frameIdx := range framePartition.frameMap {
+			frame := framePartition.frames[frameIdx]
+
+			if frame.IsDirty() {
+				// pin the frame
+				if !frame.Pin() {
+					err := fmt.Errorf("failed to pin frame")
+
+					if firstError == nil {
+						firstError = err
+					}
+
+					continue
+				}
+
+				// frame is pinned, write to disk.
+				// unlock the frame partition for
+				// slow disk operation
+				framePartition.mu.RUnlock()
+
+				// wait for prev IO to complete, then
+				// mark as started IO
+				frame.WaitIO()
+				frame.StartIO()
+
+				// write to disk, but check for
+				// frame still being dirty
+				if frame.IsDirty() {
+					err := bp.writePageOut(frame)
+
+					if err != nil && firstError == nil {
+						firstError = err
+					} else if err == nil {
+						// clear dirty if write was successful
+						frame.ClearDirty()
+					}
+				}
+
+				frame.StopIO()
+				frame.Unpin()
+
+				// re-lock the frame partition
+				framePartition.mu.RLock()
+			}
+		}
+
+		framePartition.mu.RUnlock()
+	}
+
+	return firstError
+}
