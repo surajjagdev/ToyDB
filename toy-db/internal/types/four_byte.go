@@ -16,7 +16,7 @@ type Fixed4ByteValue struct {
 }
 
 // signed 4 byte
-func NewIntegar(val int32) Fixed4ByteValue {
+func NewInteger(val int32) Fixed4ByteValue {
 	return Fixed4ByteValue{Type: IntegerType, Value: uint32(val), Valid: true}
 }
 
@@ -77,7 +77,7 @@ func (this Fixed4ByteValue) Compare(other Value) int {
 
 	switch this.Type {
 	case DateType, IntegerType:
-		// cast to int32
+		// cast to int32 for signed comparision
 		val1 := int32(this.Value)
 		val2 := int32(otherVal.Value)
 
