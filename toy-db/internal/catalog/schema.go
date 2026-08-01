@@ -11,7 +11,11 @@ type Schema struct {
 }
 
 // take via val
-func NewSchema(columns []Column) *Schema {
+func NewSchema(columns []Column) (*Schema, error) {
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("Require at least one column")
+	}
+
 	colsCp := make([]Column, len(columns))
 	copy(colsCp, columns)
 
@@ -36,10 +40,7 @@ func NewSchema(columns []Column) *Schema {
 		tupleSize = -1 // Total size changes row-by-row
 	}
 
-	return &Schema{
-		Columns:   colsCp,
-		TupleSize: tupleSize,
-	}
+	return &Schema{Columns: colsCp, TupleSize: tupleSize}, nil
 }
 
 func (s *Schema) GetColumnCount() int {
@@ -49,7 +50,7 @@ func (s *Schema) GetColumnCount() int {
 // get ptr to column based on index (0-base)
 func (s *Schema) GetColumn(i int) *Column {
 	colLen := s.GetColumnCount()
-	if i < 0 || i >= colLen {
+	if colLen == 0 || i < 0 || i > colLen {
 		panic(fmt.Sprintf("column index %d out of bounds (schema  has %d columns)", i, colLen))
 	}
 
