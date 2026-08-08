@@ -141,6 +141,11 @@ func (h *HeapPage) validateSlot(slot int) bool {
 	return true
 }
 
+// Check if tuple exists using the slot number
+func (h *HeapPage) DoesTupleInSlotExist(slot int) bool {
+	return h.validateSlot(slot)
+}
+
 // tuple crud
 
 // Get the tuple from page using the slot index.
@@ -158,13 +163,14 @@ func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
 // Insert a single tuple into the page
 func (h *HeapPage) InsertTuple(
 	data []byte,
+	nullBitmap []byte,
 	pageId common.BlockID,
 	xmin common.TransactionID,
 	cid common.CommandID,
 ) error {
 
 	// 1. Compute header offset (aligned)
-	hoff := page.AlignTo(HeapTupleHeaderMinSize, HeapTupleHeaderAlign)
+	hoff := page.AlignTo(HeapTupleHeaderMinSize+len(nullBitmap), HeapTupleHeaderAlign)
 
 	// 2. Compute total tuple size (aligned as a whole)
 	tupleSize := hoff + len(data)
@@ -206,11 +212,23 @@ func (h *HeapPage) InsertTuple(
 		uint32(cid),
 	)
 
-	// infomask / infomask2 (stubbed)
+	// NEW: Write Null Bitmap and set Infomask flag
+	infomask := uint16(0)
+	if len(nullBitmap) > 0 {
+		// heap has null
+		infomask |= 0x0001
+
+		// The Null Bitmap after tuple header byte 23
+		copy(tuple[HeapTupleHeaderMinSize:], nullBitmap)
+	}
+
+	// infomask
 	common.ByteOrder.PutUint16(
 		tuple[TupleHeaderOffsetInfomask:TupleHeaderOffsetInfomask+2],
-		0,
+		infomask,
 	)
+
+	// infomask2 - number of attrs
 	common.ByteOrder.PutUint16(
 		tuple[TupleHeaderOffsetInfomask2:TupleHeaderOffsetInfomask2+2],
 		0,

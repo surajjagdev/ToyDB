@@ -52,7 +52,7 @@ func TestTupleInsert(t *testing.T) {
 		data[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
+	err := h.InsertTuple(data, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -113,11 +113,11 @@ func TestTupleInsertMultiple(t *testing.T) {
 		data2[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data1, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
+	err := h.InsertTuple(data1, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
-	err = h.InsertTuple(data2, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
+	err = h.InsertTuple(data2, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -160,11 +160,11 @@ func TestTupleInsertMultipleAndDelete(t *testing.T) {
 		data2[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data1, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
+	err := h.InsertTuple(data1, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
-	err = h.InsertTuple(data2, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
+	err = h.InsertTuple(data2, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -224,7 +224,7 @@ func TestValidateSlotOffset(t *testing.T) {
 
 	initialFreeSpace := h.GetFreeSpace()
 
-	h.InsertTuple(data, common.BlockID(0), common.MaxTransactionID-1, common.MaxCommandID-1)
+	h.InsertTuple(data, nil, common.BlockID(0), common.MaxTransactionID-1, common.MaxCommandID-1)
 
 	newFreeSpace := h.GetFreeSpace()
 

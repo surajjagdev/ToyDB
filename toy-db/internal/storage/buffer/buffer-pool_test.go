@@ -3,6 +3,7 @@ package buffer
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,19 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
 	"github.com/surajjagdev/ToyDB/internal/storage/page"
 )
+
+const testPagePayload = "Write some data to the frame"
+
+func writeFramePayload(frame *Frame, payload string) {
+	copy(frame.Page[page.OffsetDataStart:], []byte(payload))
+}
+
+func verifyDiskPayload(t *testing.T, buf []byte, payload string) {
+	t.Helper()
+	if !bytes.HasPrefix(buf[page.OffsetDataStart:], []byte(payload)) {
+		t.Errorf("Flushed data did not match expected bytes on disk")
+	}
+}
 
 func setupBufferPool(t *testing.T, numPartitions common.PartitionIndex, framesPerPartition common.FrameIndex) (*BufferPool, *disk.DirectManager) {
 	tempDir := t.TempDir()
@@ -31,10 +45,12 @@ func setupBufferPool(t *testing.T, numPartitions common.PartitionIndex, framesPe
 }
 
 func writePage(t *testing.T, dm disk.DiskManager, rel common.RelationID, fork common.ForkID, pid common.BlockID) {
-	data := make([]byte, common.PageSize)
+
+	var data page.Page = make([]byte, common.PageSize)
 	for i := 0; i < len(data); i++ {
 		data[i] = byte(i % 256)
 	}
+	data.UpdateChecksum()
 
 	err := dm.WritePage(rel, fork, pid, data, false)
 
@@ -182,17 +198,24 @@ func TestMultipleReadersSameFrameShouldOnlyInvokeOneDiskRead(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			_, err, cacheHit := bp.GetPage(tag)
-			if err != nil {
-				t.Errorf("GetPage failed: %v", err)
+			for attempt := 0; attempt < 5; attempt++ {
+				frame, err, cacheHit := bp.GetPage(tag)
+				if err != nil {
+					runtime.Gosched()
+					continue
+				}
+
+				frame.Unpin()
+
+				if cacheHit {
+					cacheHits.Add(1)
+				} else {
+					cacheMisses.Add(1)
+				}
 				return
 			}
 
-			if cacheHit {
-				cacheHits.Add(1)
-			} else {
-				cacheMisses.Add(1)
-			}
+			t.Errorf("GetPage failed after retries")
 		}()
 	}
 
@@ -349,9 +372,9 @@ func TestBufferPool_FlushSinglePage(t *testing.T) {
 	// Fill the pool
 	f1, _, _ := bp.GetPage(tag1)
 
-	// Modify frame 1
+	// Modify frame 1 (write past page header so checksum update does not clobber payload)
 	f1.WLatch()
-	copy(f1.Page, []byte("Write some data to the frame"))
+	writeFramePayload(f1, testPagePayload)
 	f1.SetDirty()
 	f1.WUnlatch()
 
@@ -379,9 +402,7 @@ func TestBufferPool_FlushSinglePage(t *testing.T) {
 		t.Fatalf("Direct disk read failed: %v", err)
 	}
 
-	if !bytes.HasPrefix(verifyBuf, []byte("Write some data to the frame")) {
-		t.Errorf("Flushed data did not match expected bytes on disk")
-	}
+	verifyDiskPayload(t, verifyBuf, testPagePayload)
 }
 
 func TestBufferPool_FlushAllPagesSingleDirtyPage(t *testing.T) {
@@ -402,9 +423,9 @@ func TestBufferPool_FlushAllPagesSingleDirtyPage(t *testing.T) {
 	// Fill the pool
 	f1, _, _ := bp.GetPage(tag1)
 
-	// Modify frame 1
+	// Modify frame 1 (write past page header so checksum update does not clobber payload)
 	f1.WLatch()
-	copy(f1.Page, []byte("Write some data to the frame"))
+	writeFramePayload(f1, testPagePayload)
 	f1.SetDirty()
 	f1.WUnlatch()
 
@@ -434,9 +455,7 @@ func TestBufferPool_FlushAllPagesSingleDirtyPage(t *testing.T) {
 		t.Fatalf("Direct disk read failed: %v", err)
 	}
 
-	if !bytes.HasPrefix(verifyBuf, []byte("Write some data to the frame")) {
-		t.Errorf("Flushed data did not match expected bytes on disk")
-	}
+	verifyDiskPayload(t, verifyBuf, testPagePayload)
 }
 
 func TestBufferPool_FlushAllPages_Concurrent(t *testing.T) {

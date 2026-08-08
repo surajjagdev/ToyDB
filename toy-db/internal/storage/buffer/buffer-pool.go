@@ -99,6 +99,8 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 // Assume you have a write lock on the frame
 // Write the page out to disk
 func (bp *BufferPool) writePageOut(frame *Frame) error {
+	frame.Page.UpdateChecksum()
+
 	return bp.diskManager.WritePage(
 		frame.GetFrameIdentity().RelationID,
 		frame.GetFrameIdentity().ForkID,
@@ -382,6 +384,12 @@ retry:
 		tag.BlockID,
 		frame.Page,
 	)
+
+	if err == nil {
+		if !frame.Page.ValidateIntegrity() {
+			err = fmt.Errorf("page corruption detected: invalid checksum on Block %d", tag.BlockID)
+		}
+	}
 
 	// ----------------------------
 	// 6. finalize

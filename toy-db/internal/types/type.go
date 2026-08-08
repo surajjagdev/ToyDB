@@ -14,6 +14,13 @@ const (
 	TimeTzType  TypeID = 1184 // 'timestamptz' -> eight_byte
 )
 
+const (
+	BOOLEAN_TYPE_FIXED_LENGTH  int16 = 1
+	INTEGER_TYPE_FIXED_LENGTH  int16 = 4
+	FLOAT_64_TYPE_FIXED_LENGTH int16 = 8
+	DYNAMIC_TYPE_FIXED_LENGTH  int16 = -1
+)
+
 type Value interface {
 	GetTypeID() TypeID
 	Serialize() []byte
