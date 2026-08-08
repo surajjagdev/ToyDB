@@ -11,6 +11,12 @@ A wrapper for Varchar
 Anything needing var length strings
 **/
 
+const (
+	// These first bytes for var length types will tell us how many
+	// remaining bytes to read
+	VARLENGTH_HEADER_BYTES int = 4
+)
+
 type VarLenValue struct {
 	Type  TypeID
 	Value []byte // raw bytes
@@ -54,11 +60,11 @@ func (this VarLenValue) Serialize() []byte {
 	}
 
 	// 4 bytes len + data
-	buf := make([]byte, 4+len(this.Value))
+	buf := make([]byte, VARLENGTH_HEADER_BYTES+len(this.Value))
 	// store first 4 bytes as length of the varlength buffer
 	common.ByteOrder.PutUint32(buf, uint32(len(this.Value)))
 
-	copy(buf[4:], this.Value)
+	copy(buf[VARLENGTH_HEADER_BYTES:], this.Value)
 
 	return buf
 }

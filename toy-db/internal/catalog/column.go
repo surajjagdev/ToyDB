@@ -32,13 +32,13 @@ func NewColumn(name string, typeID types.TypeID, nullable bool) Column {
 
 	switch typeID {
 	case types.BooleanType:
-		col.FixedLength = 1
+		col.FixedLength = types.BOOLEAN_TYPE_FIXED_LENGTH
 	case types.IntegerType, types.DateType, types.OidType:
-		col.FixedLength = 4
+		col.FixedLength = types.INTEGER_TYPE_FIXED_LENGTH
 	case types.BigIntType, types.TimeTzType, types.Float8Type:
-		col.FixedLength = 8
+		col.FixedLength = types.FLOAT_64_TYPE_FIXED_LENGTH
 	case types.VarcharType:
-		col.FixedLength = -1 //variable length
+		col.FixedLength = types.DYNAMIC_TYPE_FIXED_LENGTH //variable length
 	default:
 		panic(fmt.Sprintf("Unknown type given: %v", typeID))
 	}

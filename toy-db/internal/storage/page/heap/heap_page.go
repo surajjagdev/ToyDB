@@ -141,6 +141,11 @@ func (h *HeapPage) validateSlot(slot int) bool {
 	return true
 }
 
+// Check if tuple exists using the slot number
+func (h *HeapPage) DoesTupleInSlotExist(slot int) bool {
+	return h.validateSlot(slot)
+}
+
 // tuple crud
 
 // Get the tuple from page using the slot index.
