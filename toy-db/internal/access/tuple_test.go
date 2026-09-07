@@ -64,7 +64,7 @@ func TestSerializeColumnsNoNulls(t *testing.T) {
 	rawPage := make(page.Page, common.PageSize)
 	heapPage := heap.InitHeapPage(rawPage)
 
-	err = heapPage.InsertTuple(
+	_, err = heapPage.InsertTuple(
 		data,
 		nullBitmap,
 		common.BlockID(0),
@@ -77,7 +77,7 @@ func TestSerializeColumnsNoNulls(t *testing.T) {
 	}
 
 	// It should be the only tuple in the page, read it back
-	slotNumber := 0
+	var slotNumber common.SlotIndex = 0
 
 	if !heapPage.DoesTupleInSlotExist(slotNumber) {
 		t.Fatalf("Expected slot at id %v to exist", slotNumber)
@@ -139,7 +139,7 @@ func TestSerializeColumnsWithNulls(t *testing.T) {
 	rawPage := make(page.Page, common.PageSize)
 	heapPage := heap.InitHeapPage(rawPage)
 
-	err = heapPage.InsertTuple(
+	_, err = heapPage.InsertTuple(
 		data,
 		nullBitmap,
 		common.BlockID(0),
@@ -152,7 +152,7 @@ func TestSerializeColumnsWithNulls(t *testing.T) {
 	}
 
 	// It should be the only tuple in the page, read it back
-	slotNumber := 0
+	var slotNumber common.SlotIndex = 0
 
 	if !heapPage.DoesTupleInSlotExist(slotNumber) {
 		t.Fatalf("Expected slot at id %v to exist", slotNumber)

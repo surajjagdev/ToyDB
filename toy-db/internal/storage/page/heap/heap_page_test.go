@@ -52,7 +52,7 @@ func TestTupleInsert(t *testing.T) {
 		data[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
+	_, err := h.InsertTuple(data, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -113,11 +113,11 @@ func TestTupleInsertMultiple(t *testing.T) {
 		data2[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data1, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
+	_, err := h.InsertTuple(data1, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
-	err = h.InsertTuple(data2, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
+	_, err = h.InsertTuple(data2, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
@@ -160,11 +160,11 @@ func TestTupleInsertMultipleAndDelete(t *testing.T) {
 		data2[i] = byte(i)
 	}
 
-	err := h.InsertTuple(data1, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
+	_, err := h.InsertTuple(data1, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(0))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}
-	err = h.InsertTuple(data2, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
+	_, err = h.InsertTuple(data2, nil, common.BlockID(1), common.TransactionID(1), common.CommandID(1))
 	if err != nil {
 		t.Fatalf("failed tuple insert %v", err)
 	}

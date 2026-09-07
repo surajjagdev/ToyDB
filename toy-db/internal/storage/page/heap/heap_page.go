@@ -125,11 +125,11 @@ func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint
 
 // get the slot index, based on slot position.
 // not guaranteed to exist
-func getSlotOffset(slot int) int {
-	return page.PageHeaderSize + slot*ItemIdSize
+func getSlotOffset(slot common.SlotIndex) int {
+	return page.PageHeaderSize + int(slot)*ItemIdSize
 }
 
-func (h *HeapPage) validateSlot(slot int) bool {
+func (h *HeapPage) validateSlot(slot common.SlotIndex) bool {
 	slotOffset := getSlotOffset(slot)
 
 	// slot is referring to unclaimed space, so it is
@@ -141,9 +141,22 @@ func (h *HeapPage) validateSlot(slot int) bool {
 	return true
 }
 
+func (h *HeapPage) GetNumSlots() int {
+	return int((h.GetLower() - page.PageHeaderSize) / ItemIdSize)
+}
+
 // Check if tuple exists using the slot number
-func (h *HeapPage) DoesTupleInSlotExist(slot int) bool {
-	return h.validateSlot(slot)
+func (h *HeapPage) DoesTupleInSlotExist(slot common.SlotIndex) bool {
+	if !h.validateSlot(slot) {
+		return false
+	}
+
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
+	_, flags, _ := h.UnpackItemId(v)
+
+	// Only return true if the slot points to a live, normal tuple
+	return flags == ItemIdFlagNormal
 }
 
 // tuple crud
@@ -151,7 +164,7 @@ func (h *HeapPage) DoesTupleInSlotExist(slot int) bool {
 // Get the tuple from page using the slot index.
 // Does not validate if slot index exists, so should be
 // done before
-func (h *HeapPage) GetTupleWithSlot(slot int) []byte {
+func (h *HeapPage) GetTupleWithSlot(slot common.SlotIndex) []byte {
 	slotOffset := getSlotOffset(slot)
 
 	// read the 4 bytes for item composed of tuple offset, flag and tuple size
@@ -167,7 +180,7 @@ func (h *HeapPage) InsertTuple(
 	pageId common.BlockID,
 	xmin common.TransactionID,
 	cid common.CommandID,
-) error {
+) (common.RecordId, error) {
 
 	// 1. Compute header offset (aligned)
 	hoff := page.AlignTo(HeapTupleHeaderMinSize+len(nullBitmap), HeapTupleHeaderAlign)
@@ -181,7 +194,7 @@ func (h *HeapPage) InsertTuple(
 
 	// 3. Check available space
 	if int(upper-lower) < ItemIdSize+tupleSize {
-		return fmt.Errorf("page is full")
+		return common.RecordId{}, fmt.Errorf("page is full")
 	}
 
 	// 4. Allocate space from upper (tuples grow downward)
@@ -273,12 +286,15 @@ func (h *HeapPage) InsertTuple(
 		uint16(slotIndex),
 	)
 
-	return nil
+	return common.RecordId{
+		BlockID: pageId,
+		Slot:    common.SlotIndex(slotIndex),
+	}, nil
 }
 
 // Logical Deletion of tuple from page
 func (h *HeapPage) DeleteTuple(
-	slot int,
+	slot common.SlotIndex,
 	xmax common.TransactionID,
 	cid common.CommandID,
 ) error {

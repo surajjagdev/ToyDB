@@ -33,6 +33,8 @@ const (
 	MaxCommandID         CommandID     = InvalidCommandID - 1
 	InvalidLogSeqNumber  LogSeqNumber  = LogSeqNumber(^uint64(0))
 	MaxLogSeqNumber      LogSeqNumber  = InvalidLogSeqNumber - 1
+	InvalidSlotIndex     SlotIndex     = SlotIndex(^uint16(0))
+	MaxSlotIndex         SlotIndex     = InvalidSlotIndex - 1
 )
 
 // const (

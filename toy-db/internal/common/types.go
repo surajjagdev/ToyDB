@@ -45,3 +45,10 @@ type LogSeqNumber uint64
 
 type FrameIndex uint32
 type PartitionIndex uint32
+
+type SlotIndex uint16
+
+type RecordId struct {
+	BlockID BlockID
+	Slot    SlotIndex
+}
