@@ -62,6 +62,8 @@ type Frame struct {
 	ioCond *sync.Cond
 
 	ptr unsafe.Pointer // only used on Linux for aligned pages
+
+	onEvictable func()
 }
 
 // NewFrame creates a new frame for a page
@@ -214,6 +216,9 @@ func (f *Frame) Unpin() {
 		pins := old & PinCountMask
 		newState := (old & ^PinCountMask) | (pins - 1)
 		if atomic.CompareAndSwapUint32(&f.state, old, newState) {
+			if newState&PinCountMask == 0 && f.onEvictable != nil {
+				f.onEvictable()
+			}
 			return
 		}
 	}
@@ -325,6 +330,10 @@ func (f *Frame) StopIO() {
 	// broadcast that the ioi progress has been cleared
 	f.ioCond.Broadcast()
 	f.ioMu.Unlock()
+
+	if f.onEvictable != nil {
+		f.onEvictable()
+	}
 }
 
 func (f *Frame) WaitIO() {
