@@ -562,3 +562,90 @@ func TestBufferPool_FlushAllPages_Concurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestBufferPool_DuplicateMappingCorruption(t *testing.T) {
+	// Real DirectManager, tiny Buffer Pool (1 partition, 2 frames)
+	bp, dm := setupBufferPool(t, 1, 1)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(999)
+	fork := common.ForkID(0)
+
+	// 1. Physically allocate the blocks on disk so GetPage doesn't fail with EOF
+	b1, _ := dm.AllocateBlock(rel, fork)
+	b2, _ := dm.AllocateBlock(rel, fork)
+
+	writePage(t, dm, rel, fork, b1)
+	writePage(t, dm, rel, fork, b2)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	tag2 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b2} // The highly contested block
+
+	// 2. Fill frame and make them dirty (forces eviction to be slow)
+	f1, err, _ := bp.GetPage(tag1)
+	if err != nil {
+		t.Fatalf("Failed to get Block 1: %v", err)
+	}
+	f1.WLatch()
+	writeFramePayload(f1, testPagePayload)
+	f1.SetDirty()
+	f1.WUnlatch()
+	f1.Unpin()
+
+	// 3. Fire 50 threads that ALL ask for Block 3 simultaneously.
+	// Since both frames are dirty, the eviction process will require real disk IO.
+	numGoroutines := 50
+	var wg sync.WaitGroup
+	frameChan := make(chan *Frame, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// This is where the race condition occurs!
+			f, getErr, _ := bp.GetPage(tag2)
+			if getErr == nil {
+				frameChan <- f
+				f.Unpin()
+			} else {
+				t.Errorf("GetPage failed: %v", getErr)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(frameChan)
+
+	// expect first page to be written to disk, without using buffer pool
+	verifyBuf, ptr, err := allocPageData()
+	if err != nil {
+		t.Fatalf("Failed to alloc verify buffer: %v", err)
+	}
+	defer freePageData(ptr)
+
+	err = dm.ReadPage(rel, fork, b1, page.Page(verifyBuf))
+	if err != nil {
+		t.Fatalf("Direct disk read failed: %v", err)
+	}
+
+	verifyDiskPayload(t, verifyBuf, testPagePayload)
+
+	// 4. Verify results
+	// The first thread should do the disk IO, and the other 49 threads MUST get
+	// the exact same *Frame pointer (because they should hit WaitIO() instead of
+	// evicting a second frame!)
+	var firstFrame *Frame
+	isFirst := true
+
+	for f := range frameChan {
+		if isFirst {
+			firstFrame = f
+			isFirst = false
+		} else {
+			if f != firstFrame {
+				t.Fatalf("🚨 CORRUPTION CAUGHT: Threads were given TWO DIFFERENT frames for the exact same BlockID!")
+			}
+		}
+	}
+}

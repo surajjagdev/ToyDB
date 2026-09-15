@@ -22,6 +22,8 @@ type vfdEntry struct {
 	file     *os.File
 	refCount uint32
 	elem     *list.Element
+
+	mu sync.RWMutex
 }
 
 type VFDCache struct {
@@ -62,9 +64,39 @@ func NewDirectVFD(capacity int) *VFDCache {
 	}
 }
 
+func (e *vfdEntry) ReadAt(p []byte, off int64) (int, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.file.ReadAt(p, off)
+}
+
+// WriteAt serializes writes against reads, writes, and closes.
+func (e *vfdEntry) WriteAt(p []byte, off int64) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.file.WriteAt(p, off)
+}
+
+// Sync flushes the underlying file.
+func (e *vfdEntry) Sync() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.file.Sync()
+}
+
+func (e *vfdEntry) closeFile() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.file == nil {
+		return nil
+	}
+	err := e.file.Close()
+	e.file = nil
+	return err
+}
+
 // evict least recently used element
 func (v *VFDCache) evictOne() (error, bool) {
-	// evict the first entry that is not used
 	lastElement := v.lruList.Back()
 
 	for {
@@ -79,11 +111,9 @@ func (v *VFDCache) evictOne() (error, bool) {
 			continue
 		}
 
-		// close the os file
-		if entry.file != nil {
-			if err := entry.file.Close(); err != nil {
-				return err, false
-			}
+		// Close under the entry lock so we don't race an in-flight I/O.
+		if err := entry.closeFile(); err != nil {
+			return err, false
 		}
 
 		// remove from lru cache
@@ -91,7 +121,6 @@ func (v *VFDCache) evictOne() (error, bool) {
 		entry.elem = nil
 		delete(v.cache, entry.fileNode)
 
-		// entry in cache can remain
 		return nil, true
 	}
 }
@@ -162,13 +191,8 @@ func (v *VFDCache) CloseAll(force bool) error {
 		entry := ele.Value.(*vfdEntry)
 
 		if entry.refCount == 0 || force {
-			if entry.file != nil {
-				err := entry.file.Close()
-				if err != nil && firstError == nil {
-					firstError = err
-				}
-
-				entry.file = nil
+			if err := entry.closeFile(); err != nil && firstError == nil {
+				firstError = err
 			}
 
 			v.lruList.Remove(ele)

@@ -54,7 +54,16 @@ func (f *FSM) RecordFreeSpace(rel common.RelationID, tableBlock common.BlockID, 
 			break
 		}
 
-		// fsm does not exist, so allocate it
+		dm, dmErr := f.bp.GetDiskManager()
+		if dmErr == nil {
+			_, err = dm.AllocateBlock(rel, common.ForkFSM)
+
+			if err != nil {
+				break
+			}
+		}
+
+		// fsm now physically exists, put into buffer pool
 		frame, err = f.bp.AllocatePage(tag)
 
 		if err == nil {
@@ -107,7 +116,9 @@ func (f *FSM) GetBlockWithFreeSpace(rel common.RelationID, freeBytesRequired int
 		frame, err, _ := f.bp.GetPage(tag)
 
 		if err != nil {
-			// End of all fsm blocks, no space
+			// End of all fsm blocks -> no space,
+			// or none present
+			// return no err
 			return common.InvalidBlockID, nil
 		}
 

@@ -46,7 +46,7 @@ func (d *DirectManager) ReadPage(rel common.RelationID, fork common.ForkID, page
 	defer d.vfd.Release(entry)
 
 	// read data at seek pos
-	n, err := entry.file.ReadAt(data, offset)
+	n, err := entry.ReadAt(data, offset)
 	if err != nil && err != io.EOF {
 		return err
 	}
@@ -94,7 +94,7 @@ func (d *DirectManager) WritePage(rel common.RelationID, fork common.ForkID, pag
 
 	defer d.vfd.Release(entry)
 
-	n, err := entry.file.WriteAt(data, offset)
+	n, err := entry.WriteAt(data, offset)
 	if err != nil {
 		return err
 	}

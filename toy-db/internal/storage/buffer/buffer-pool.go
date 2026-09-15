@@ -99,15 +99,23 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 // Assume you have a write lock on the frame
 // Write the page out to disk
 func (bp *BufferPool) writePageOut(frame *Frame) error {
+	frame.WLatch()
+	defer frame.WUnlatch()
+
 	frame.Page.UpdateChecksum()
 
-	return bp.diskManager.WritePage(
+	if err := bp.diskManager.WritePage(
 		frame.GetFrameIdentity().RelationID,
 		frame.GetFrameIdentity().ForkID,
 		frame.GetFrameIdentity().BlockID,
 		frame.Page,
 		false,
-	)
+	); err != nil {
+		return err
+	}
+
+	frame.ClearDirty()
+	return nil
 }
 
 // From internet, seems to be a good hash function for this use case
@@ -249,8 +257,6 @@ func (bp *BufferPool) evictFrame(framePartition common.PartitionIndex) (*Frame, 
 			frame.StopIO()
 			return nil, BufferTag{}, INVALID_IDX, fmt.Errorf("failed to flush dirty page: %w", err)
 		}
-
-		frame.ClearDirty()
 	}
 
 	frame.ClearValid()
@@ -298,6 +304,7 @@ func (bp *BufferPool) getPageFromCache(framePartition *FramePartition, tag Buffe
 
 // We need to get a page by its tag and load into a frame. If it already exists,
 // great. otherwise we will need to load from disk
+// Page is returned pinned, so you must unpin it
 func (bp *BufferPool) GetPage(tag BufferTag) (*Frame, error, bool) {
 	if bp.isShuttingDown.Load() {
 		return nil, fmt.Errorf("buffer pool is shutting down"), false
@@ -321,6 +328,14 @@ func (bp *BufferPool) GetPage(tag BufferTag) (*Frame, error, bool) {
 retry:
 
 	framePartition.mu.Lock()
+
+	fmt.Printf(
+		"DOUBLE CHECK tag=%+v partition=%d map=%p len=%d\n",
+		tag,
+		partitionIdx,
+		framePartition.frameMap,
+		len(framePartition.frameMap),
+	)
 
 	// ----------------------------
 	// 2. double check
@@ -404,7 +419,7 @@ retry:
 		frame.Unpin()
 
 		delete(framePartition.frameMap, tag)
-		framePartition.freeFrames = append(framePartition.freeFrames, frameIdx)
+		//framePartition.freeFrames = append(framePartition.freeFrames, frameIdx)
 
 		return nil, err, false
 	}
@@ -492,6 +507,7 @@ func (bp *BufferPool) Shutdown() error {
 }
 
 // Allocate page
+// page is returned pinned, so unpin it
 func (bp *BufferPool) AllocatePage(tag BufferTag) (*Frame, error) {
 	// 1. Check if buffer pool is active
 	if bp.isShuttingDown.Load() {
@@ -583,10 +599,6 @@ func (bp *BufferPool) FlushPage(tag BufferTag) error {
 
 	if frame.IsDirty() {
 		err = bp.writePageOut(frame)
-
-		if err == nil {
-			frame.ClearDirty()
-		}
 	}
 
 	// release io and unpin
@@ -639,9 +651,6 @@ func (bp *BufferPool) FlushAllPages() error {
 
 					if err != nil && firstError == nil {
 						firstError = err
-					} else if err == nil {
-						// clear dirty if write was successful
-						frame.ClearDirty()
 					}
 				}
 
@@ -657,4 +666,13 @@ func (bp *BufferPool) FlushAllPages() error {
 	}
 
 	return firstError
+}
+
+// Get buffer pool instance
+func (bp *BufferPool) GetDiskManager() (disk.DiskManager, error) {
+	if bp.isShuttingDown.Load() {
+		return nil, fmt.Errorf("Buffer pool is shutting down")
+	}
+
+	return bp.diskManager, nil
 }

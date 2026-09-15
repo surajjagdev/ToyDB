@@ -173,6 +173,29 @@ func (h *HeapPage) GetTupleWithSlot(slot common.SlotIndex) []byte {
 	return h.Page[offset : offset+size]
 }
 
+// Calculate the bytes needed to insert a tuple into the page
+// if null bitmap is not provided, nullBitmapLen should be 0
+// if data is not provided, dataLen should be 0
+
+// Takes header offset + null bitmap length + data length and aligns to 8 bytes
+// then adds the item id size to get the total bytes needed to insert the tuple
+// dataLen -> length of the data to be inserted
+// nullBitmapLen -> length of the null bitmap
+// returns the bytes header offset, tuple size and the total bytes needed to insert the tuple
+func CalculateBytesNeededToInsertTuple(dataLen int, nullBitmapLen int) (hoff int, tupleSize int, requiredSpace int) {
+	hoff = 0
+	tupleSize = 0
+	requiredSpace = 0
+
+	// calculate header offset -> minimum header without null bitmap + nullbitmap length -> align to 8 bytes
+	hoff = page.AlignTo(HeapTupleHeaderMinSize+nullBitmapLen, HeapTupleHeaderAlign)
+
+	// calculate tuple size -> header offset + data length -> align to 8 bytes
+	tupleSize = page.AlignTo(hoff+dataLen, HeapTupleHeaderAlign)
+
+	return hoff, tupleSize, tupleSize + ItemIdSize
+}
+
 // Insert a single tuple into the page
 func (h *HeapPage) InsertTuple(
 	data []byte,
@@ -182,18 +205,14 @@ func (h *HeapPage) InsertTuple(
 	cid common.CommandID,
 ) (common.RecordId, error) {
 
-	// 1. Compute header offset (aligned)
-	hoff := page.AlignTo(HeapTupleHeaderMinSize+len(nullBitmap), HeapTupleHeaderAlign)
-
-	// 2. Compute total tuple size (aligned as a whole)
-	tupleSize := hoff + len(data)
-	tupleSize = page.AlignTo(tupleSize, HeapTupleHeaderAlign)
+	// 1., 2. Compute header offset (aligned) and tuple size (aligned)
+	hoff, tupleSize, requiredSpace := CalculateBytesNeededToInsertTuple(len(data), len(nullBitmap))
 
 	upper := h.GetUpper()
 	lower := h.GetLower()
 
 	// 3. Check available space
-	if int(upper-lower) < ItemIdSize+tupleSize {
+	if int(upper-lower) < requiredSpace {
 		return common.RecordId{}, fmt.Errorf("page is full")
 	}
 
@@ -302,12 +321,6 @@ func (h *HeapPage) DeleteTuple(
 	slotOffset := getSlotOffset(slot)
 
 	if exists := h.validateSlot(slot); !exists {
-		return fmt.Errorf("invalid slot %d", slot)
-	}
-
-	// slot is referring to unclaimed space, so it is
-	// not valid
-	if slotOffset+ItemIdSize > int(h.GetLower()) {
 		return fmt.Errorf("invalid slot %d", slot)
 	}
 

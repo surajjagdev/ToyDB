@@ -51,7 +51,7 @@ func (d *CachedManager) ReadPage(
 	defer d.vfd.Release(entry)
 
 	// read data at seek pos
-	n, err := entry.file.ReadAt(data, offset)
+	n, err := entry.ReadAt(data, offset)
 	if err != nil && err != io.EOF {
 		return err
 	}
@@ -106,7 +106,7 @@ func (d *CachedManager) WritePage(
 
 	defer d.vfd.Release(entry)
 
-	n, err := entry.file.WriteAt(data, offset)
+	n, err := entry.WriteAt(data, offset)
 	if err != nil {
 		return err
 	}
@@ -207,7 +207,7 @@ func (m *CachedManager) SyncPage(rel common.RelationID, fork common.ForkID, page
 		return err
 	}
 	defer m.vfd.Release(entry)
-	return entry.file.Sync()
+	return entry.Sync()
 }
 
 func (m *CachedManager) Shutdown() error {
