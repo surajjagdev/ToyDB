@@ -158,7 +158,7 @@ func (bp *BufferPool) getPartitionIndex(tag BufferTag) common.PartitionIndex {
 }
 
 // Assumes you have a write lock on the frame partition
-func (fp *FramePartition) isFrameInFreeFrameList() bool {
+func (fp *FramePartition) freeFramesAvail() bool {
 	return len(fp.freeFrames) > 0
 }
 
@@ -276,7 +276,7 @@ func (bp *BufferPool) evictFrame(
 	// ----------------------------
 	// 1. pick a frame
 	// ----------------------------
-	if fp.isFrameInFreeFrameList() {
+	if fp.freeFramesAvail() {
 		var popOk bool
 		idx, popOk = fp.popFreeFrame()
 		if !popOk {
