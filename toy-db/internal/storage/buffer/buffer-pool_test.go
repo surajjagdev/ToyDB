@@ -405,6 +405,131 @@ func TestBufferPool_FlushSinglePage(t *testing.T) {
 	verifyDiskPayload(t, verifyBuf, testPagePayload)
 }
 
+func TestBufferPool_AllFramesPinned(t *testing.T) {
+	// Tiny buffer pool: 1 partition, 2 frames total
+	bp, dm := setupBufferPool(t, 1, 2)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(999)
+	fork := common.ForkID(0)
+
+	// Allocate 3 blocks
+	b1, _ := dm.AllocateBlock(rel, fork)
+	b2, _ := dm.AllocateBlock(rel, fork)
+	b3, _ := dm.AllocateBlock(rel, fork)
+
+	writePage(t, dm, rel, fork, b1)
+	writePage(t, dm, rel, fork, b2)
+	writePage(t, dm, rel, fork, b3)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	tag2 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b2}
+	tag3 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b3}
+
+	// 1. Fetch and PIN Frame 1
+	f1, err, _ := bp.GetPage(tag1)
+	if err != nil {
+		t.Fatalf("Failed to get Block 1: %v", err)
+	}
+	// DO NOT UNPIN f1!
+
+	// 2. Fetch and PIN Frame 2
+	f2, err, _ := bp.GetPage(tag2)
+	if err != nil {
+		t.Fatalf("Failed to get Block 2: %v", err)
+	}
+	// DO NOT UNPIN f2!
+
+	// 3. At this point, the entire Buffer Pool is 100% full and 100% pinned.
+	// We will launch a Goroutine that asks for Block 3.
+	// It should block and wait for `evictionWaitTimeout` (1 second in your code).
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, 1)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		// This should block, and eventually return an error because no frames
+		// become available within the timeout.
+		_, getErr, _ := bp.GetPage(tag3)
+		errChan <- getErr
+	}()
+
+	// Wait for the goroutine to finish its timeout
+	wg.Wait()
+	close(errChan)
+
+	// 4. Verify it failed gracefully instead of stealing a pinned frame
+	getErr := <-errChan
+	if getErr == nil {
+		t.Fatalf("🚨 FATAL FLAW: GetPage succeeded and stole a pinned frame!")
+	}
+
+	expectedErrMsg := "no victim frames found within" // Matches your timeout error string
+	if !bytes.Contains([]byte(getErr.Error()), []byte(expectedErrMsg)) {
+		t.Errorf("Expected timeout error, got: %v", getErr)
+	}
+
+	// 5. Clean up the pins so the pool shuts down safely
+	f1.Unpin()
+	f2.Unpin()
+}
+
+func TestBufferPool_EvictionWakeupOnUnpin(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 1) // Just 1 frame!
+	defer bp.Shutdown()
+
+	rel := common.RelationID(888)
+	fork := common.ForkID(0)
+
+	b1, _ := dm.AllocateBlock(rel, fork)
+	b2, _ := dm.AllocateBlock(rel, fork)
+	writePage(t, dm, rel, fork, b1)
+	writePage(t, dm, rel, fork, b2)
+
+	tag1 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	tag2 := BufferTag{RelationID: rel, ForkID: fork, BlockID: b2}
+
+	// 1. Claim the only frame
+	f1, _, _ := bp.GetPage(tag1)
+	// It is now pinned!
+
+	var wg sync.WaitGroup
+	successChan := make(chan bool, 1)
+
+	// 2. Launch a thread asking for a new block.
+	// It will block on fp.evictable because the only frame is pinned.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		f2, err, _ := bp.GetPage(tag2)
+		if err == nil {
+			f2.Unpin()
+			successChan <- true
+		} else {
+			successChan <- false
+		}
+	}()
+
+	// 3. Wait a tiny fraction of a second to ensure the goroutine is asleep
+	time.Sleep(100 * time.Millisecond)
+
+	// 4. Unpin the first frame! This should trigger `notifyEvictable()` and wake the goroutine!
+	f1.Unpin()
+
+	// 5. Wait for the goroutine to finish
+	wg.Wait()
+	close(successChan)
+
+	success := <-successChan
+	if !success {
+		t.Fatalf("🚨 The waiting thread failed to wake up and claim the unpinned frame!")
+	}
+}
+
 func TestBufferPool_FlushAllPagesSingleDirtyPage(t *testing.T) {
 	// Tiny buffer pool: 1 partition, 1 frames total
 	bp, dm := setupBufferPool(t, 1, 1)

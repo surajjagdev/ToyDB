@@ -148,15 +148,20 @@ func (f *Frame) GetFrameIdentity() BufferTag {
 // once this is set, the frame should be invisible for reuse, till it can be reused
 // panics if pinned
 func (f *Frame) SetFrameIdentity(blockId common.BlockID, forkId common.ForkID, rel common.RelationID) {
-	if f.IsPinned() {
-		panic("Setting identity on pinned frame")
-	}
+	// if f.IsPinned() {
+	// 	panic("Setting identity on pinned frame")
+	// }
 
-	f.bufferTag = BufferTag{
-		BlockID:    blockId,
-		ForkID:     forkId,
-		RelationID: rel,
+	// f.bufferTag = BufferTag{
+	// 	BlockID:    blockId,
+	// 	ForkID:     forkId,
+	// 	RelationID: rel,
+	// }
+
+	if !f.IsIOInProgress() {
+		panic("SetFrameIdentity called without owning IO")
 	}
+	f.bufferTag = BufferTag{BlockID: blockId, ForkID: forkId, RelationID: rel}
 }
 
 // Returns pin count
