@@ -44,7 +44,15 @@ type PartitionIndex uint32
 
 type SlotIndex uint16
 
+// inside the context, already knows the relationship - so we keep rowid and recordid separate
 type RecordId struct {
-	BlockID BlockID
+	BlockID BlockID //
 	Slot    SlotIndex
+}
+
+// uniquely identifies a tuple
+type RowId struct {
+	RelationID RelationID // identifies the table
+	BlockID    BlockID    // identifies the page
+	Slot       SlotIndex  // identifies tuple slot in page
 }

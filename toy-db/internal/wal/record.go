@@ -164,17 +164,109 @@ func DecodeFPW(b []byte) (pageID uint64, page []byte, err error) {
 	return common.ByteOrder.Uint64(b[0:]), b[8:], nil
 }
 
-func EncodeInsert(pageID uint64, slot uint16, tuple []byte) []byte {
-	out := make([]byte, 10+len(tuple))
-	common.ByteOrder.PutUint64(out[0:], pageID)
-	common.ByteOrder.PutUint16(out[8:], slot)
-	copy(out[10:], tuple)
-	return out
+// EncodeInsert builds the payload for a RecInsert record.
+//
+// Layout:
+//
+//	rel(4) | block(8) | slot(2) | tupleLen(4) | tuple(tupleLen)
+//
+// The relation is included because recovery has to know which table to
+// apply the insert to. A WAL segment can contain records for many relations.
+func EncodeInsert(row common.RowId, tuple []byte) []byte {
+	buf := make([]byte, 18+len(tuple))
+	common.ByteOrder.PutUint32(buf[0:], uint32(row.RelationID))
+	common.ByteOrder.PutUint64(buf[4:], uint64(row.BlockID))
+	common.ByteOrder.PutUint16(buf[12:], uint16(row.Slot))
+	common.ByteOrder.PutUint32(buf[14:], uint32(len(tuple)))
+	copy(buf[18:], tuple)
+	return buf
 }
 
-func DecodeInsert(b []byte) (pageID uint64, slot uint16, tuple []byte, err error) {
-	if len(b) < 10 {
-		return 0, 0, nil, ErrCorrupt
+// DecodeInsert parses a RecInsert payload. The returned tuple slice aliases
+// the input buffer.
+func DecodeInsert(b []byte) (common.RowId, []byte, error) {
+	if len(b) < 18 {
+		return common.RowId{}, nil, ErrCorrupt
 	}
-	return common.ByteOrder.Uint64(b[0:]), common.ByteOrder.Uint16(b[8:]), b[10:], nil
+	row := common.RowId{
+		RelationID: common.RelationID(common.ByteOrder.Uint32(b[0:])),
+		BlockID:    common.BlockID(common.ByteOrder.Uint64(b[4:])),
+		Slot:       common.SlotIndex(common.ByteOrder.Uint16(b[12:])),
+	}
+	tupleLen := common.ByteOrder.Uint32(b[14:])
+	if uint32(len(b)) < 18+tupleLen {
+		return common.RowId{}, nil, ErrCorrupt
+	}
+	return row, b[18 : 18+tupleLen], nil
+}
+
+// EncodeDelete builds the payload for a RecDelete record.
+//
+// Layout:
+//
+//	rel(4) | block(8) | slot(2) | beforeLen(4) | before(beforeLen)
+func EncodeDelete(row common.RowId, before []byte) []byte {
+	buf := make([]byte, 18+len(before))
+	common.ByteOrder.PutUint32(buf[0:], uint32(row.RelationID))
+	common.ByteOrder.PutUint64(buf[4:], uint64(row.BlockID))
+	common.ByteOrder.PutUint16(buf[12:], uint16(row.Slot))
+	common.ByteOrder.PutUint32(buf[14:], uint32(len(before)))
+	copy(buf[18:], before)
+	return buf
+}
+
+func DecodeDelete(b []byte) (common.RowId, []byte, error) {
+	if len(b) < 18 {
+		return common.RowId{}, nil, ErrCorrupt
+	}
+	row := common.RowId{
+		RelationID: common.RelationID(common.ByteOrder.Uint32(b[0:])),
+		BlockID:    common.BlockID(common.ByteOrder.Uint64(b[4:])),
+		Slot:       common.SlotIndex(common.ByteOrder.Uint16(b[12:])),
+	}
+	beforeLen := common.ByteOrder.Uint32(b[14:])
+	if uint32(len(b)) < 18+beforeLen {
+		return common.RowId{}, nil, ErrCorrupt
+	}
+	return row, b[18 : 18+beforeLen], nil
+}
+
+// EncodeUpdate builds the payload for a RecUpdate record. If you always model
+// updates as delete+insert at the heap level, this is optional. But if you
+// ever want a single record describing both the old and new versions of a
+// row, keep it.
+//
+// Layout:
+//
+//	rel(4) | block(8) | slot(2) | beforeLen(4) | afterLen(4)
+//	| before(beforeLen) | after(afterLen)
+func EncodeUpdate(row common.RowId, before, after []byte) []byte {
+	buf := make([]byte, 22+len(before)+len(after))
+	common.ByteOrder.PutUint32(buf[0:], uint32(row.RelationID))
+	common.ByteOrder.PutUint64(buf[4:], uint64(row.BlockID))
+	common.ByteOrder.PutUint16(buf[12:], uint16(row.Slot))
+	common.ByteOrder.PutUint32(buf[14:], uint32(len(before)))
+	common.ByteOrder.PutUint32(buf[18:], uint32(len(after)))
+	copy(buf[22:], before)
+	copy(buf[22+len(before):], after)
+	return buf
+}
+
+func DecodeUpdate(b []byte) (common.RowId, []byte, []byte, error) {
+	if len(b) < 22 {
+		return common.RowId{}, nil, nil, ErrCorrupt
+	}
+	row := common.RowId{
+		RelationID: common.RelationID(common.ByteOrder.Uint32(b[0:])),
+		BlockID:    common.BlockID(common.ByteOrder.Uint64(b[4:])),
+		Slot:       common.SlotIndex(common.ByteOrder.Uint16(b[12:])),
+	}
+	beforeLen := common.ByteOrder.Uint32(b[14:])
+	afterLen := common.ByteOrder.Uint32(b[18:])
+	if uint32(len(b)) < 22+beforeLen+afterLen {
+		return common.RowId{}, nil, nil, ErrCorrupt
+	}
+	before := b[22 : 22+beforeLen]
+	after := b[22+beforeLen : 22+beforeLen+afterLen]
+	return row, before, after, nil
 }

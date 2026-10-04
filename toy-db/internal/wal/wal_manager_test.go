@@ -636,3 +636,148 @@ func TestWALConcurrentAppenders(t *testing.T) {
 		}
 	}
 }
+
+// -----------------------------------------------------------------------------
+// ReadAt
+// -----------------------------------------------------------------------------
+
+// TestWALReadAtRoundTrip appends a batch of records with distinct payloads,
+// then reads each one back by its assigned LSN.
+func TestWALReadAtRoundTrip(t *testing.T) {
+	opts := testOptions(t)
+	vfd := disk.NewCachedVFD(8)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	const n = 50
+	type expected struct {
+		lsn  LSN
+		data []byte
+		typ  RecordType
+	}
+	want := make([]expected, n)
+
+	for i := 0; i < n; i++ {
+		data := []byte(fmt.Sprintf("record-%d-payload", i))
+		typ := RecInsert
+		if i%2 == 0 {
+			typ = RecUpdate
+		}
+		lsn, err := w.Append(&Record{
+			Type:  typ,
+			Flags: FlagHasAfter,
+			Data:  data,
+		})
+		if err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+		want[i] = expected{lsn: lsn, data: data, typ: typ}
+	}
+
+	if err := w.Sync(context.Background(), want[n-1].lsn); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, e := range want {
+		got, err := w.ReadAt(e.lsn)
+		if err != nil {
+			t.Fatalf("ReadAt %d (%v): %v", i, e.lsn, err)
+		}
+		if got.LSN != e.lsn {
+			t.Errorf("record %d: LSN got %v want %v", i, got.LSN, e.lsn)
+		}
+		if got.Type != e.typ {
+			t.Errorf("record %d: Type got %v want %v", i, got.Type, e.typ)
+		}
+		if string(got.Data) != string(e.data) {
+			t.Errorf("record %d: Data got %q want %q", i, got.Data, e.data)
+		}
+	}
+}
+
+// TestWALReadAtAcrossRotation verifies ReadAt can locate records that live
+// in different segments after rotation.
+func TestWALReadAtAcrossRotation(t *testing.T) {
+	opts := testOptions(t)
+	opts.SegmentSize = 1024 // force rotation
+	opts.MaxBatch = 256
+	vfd := disk.NewCachedVFD(16)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	const n = 200
+	lsns := make([]LSN, n)
+	data := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		data[i] = []byte(fmt.Sprintf("payload-%03d", i))
+		lsn, err := w.Append(&Record{
+			Type: RecInsert,
+			Data: data[i],
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lsns[i] = lsn
+	}
+	if err := w.Sync(context.Background(), lsns[n-1]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify every record is recoverable.
+	for i := 0; i < n; i++ {
+		rec, err := w.ReadAt(lsns[i])
+		if err != nil {
+			t.Fatalf("ReadAt %d (%v): %v", i, lsns[i], err)
+		}
+		if string(rec.Data) != string(data[i]) {
+			t.Errorf("record %d: got %q want %q", i, rec.Data, data[i])
+		}
+	}
+}
+
+// TestWALReadAtBadLSN verifies ReadAt returns an error (not a panic) for
+// LSNs that don't point at a valid record.
+func TestWALReadAtBadLSN(t *testing.T) {
+	opts := testOptions(t)
+	vfd := disk.NewCachedVFD(8)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// Empty WAL: any LSN is invalid.
+	if _, err := w.ReadAt(MakeLSN(1, 0)); err == nil {
+		t.Error("ReadAt on empty WAL: expected error")
+	}
+
+	// Append one record so the segment exists.
+	lsn, _ := w.Append(&Record{Type: RecInsert, Data: []byte("x")})
+	if err := w.Sync(context.Background(), lsn); err != nil {
+		t.Fatal(err)
+	}
+
+	// LSN past the end of valid records.
+	if _, err := w.ReadAt(MakeLSN(1, 999999)); err == nil {
+		t.Error("ReadAt past end: expected error")
+	}
+
+	// LSN in a segment that doesn't exist.
+	if _, err := w.ReadAt(MakeLSN(99, 0)); err == nil {
+		t.Error("ReadAt on missing segment: expected error")
+	}
+
+	// LSN in the middle of a record.
+	if _, err := w.ReadAt(MakeLSN(1, 5)); err == nil {
+		t.Error("ReadAt mid-record: expected error")
+	}
+}

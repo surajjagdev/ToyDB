@@ -10,9 +10,9 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
-type testLogFlusher struct{}
+type testLogFlusherFSM struct{}
 
-func (testLogFlusher) FlushUpTo(lsn wal.LSN) error { return nil }
+func (testLogFlusherFSM) FlushUpTo(lsn wal.LSN) error { return nil }
 
 // Helper to set up a real Buffer Pool for testing the Access Layer
 func setupTestFSM(t *testing.T) (*FSM, *buffer.BufferPool) {

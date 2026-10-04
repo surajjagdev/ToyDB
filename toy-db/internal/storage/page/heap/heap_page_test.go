@@ -1,6 +1,7 @@
 package heap
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
@@ -239,5 +240,66 @@ func TestValidateSlotOffset(t *testing.T) {
 
 	if slot12Exists := h.validateSlot(12); slot12Exists {
 		t.Fatalf("Expected slot index 12 to not exist")
+	}
+}
+
+// TestCanDeleteTuple verifies the read-only pre-check agrees with DeleteTuple
+// about whether a slot is deletable.
+func TestCanDeleteTuple(t *testing.T) {
+	p := page.Page(make([]byte, common.PageSize))
+	h := InitHeapPage(p)
+
+	data := []byte("some tuple bytes")
+	nulls := []byte{0x00}
+	rid, err := h.InsertTuple(data, nulls, 1, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Live tuple: deletable.
+	if err := h.CanDeleteTuple(rid.Slot); err != nil {
+		t.Errorf("live tuple: CanDeleteTuple = %v, want nil", err)
+	}
+
+	// Delete it.
+	if err := h.DeleteTuple(rid.Slot, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deleted tuple: not deletable.
+	if err := h.CanDeleteTuple(rid.Slot); err == nil {
+		t.Error("deleted tuple: CanDeleteTuple should fail")
+	}
+
+	// Invalid slot: not deletable.
+	if err := h.CanDeleteTuple(common.SlotIndex(999)); err == nil {
+		t.Error("invalid slot: CanDeleteTuple should fail")
+	}
+}
+
+// TestCanDeleteTupleIsReadOnly verifies the pre-check does not mutate the page.
+func TestCanDeleteTupleIsReadOnly(t *testing.T) {
+	p := page.Page(make([]byte, common.PageSize))
+	h := InitHeapPage(p)
+
+	data := []byte("payload")
+	rid, err := h.InsertTuple(data, nil, 1, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot the tuple bytes and the page's lower/upper.
+	before := append([]byte(nil), h.GetTupleWithSlot(rid.Slot)...)
+	beforeLower := p.GetLower()
+	beforeUpper := p.GetUpper()
+
+	_ = h.CanDeleteTuple(rid.Slot)
+
+	after := h.GetTupleWithSlot(rid.Slot)
+	if !bytes.Equal(before, after) {
+		t.Error("CanDeleteTuple mutated the tuple bytes")
+	}
+	if p.GetLower() != beforeLower || p.GetUpper() != beforeUpper {
+		t.Error("CanDeleteTuple mutated page pointers")
 	}
 }

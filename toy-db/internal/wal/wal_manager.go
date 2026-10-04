@@ -445,6 +445,68 @@ func (w *WAL) ResetFPWSet() {
 	w.fpwSeen = make(map[common.BlockID]struct{})
 }
 
+// fns
+
+// ReadAt fetches the single record located at lsn. Used by the undo pass
+// during recovery and abort to walk the per-transaction PrevLSN chain.
+//
+// Returns ErrBadLSN if lsn does not point at a record boundary, ErrShortRead
+// if the segment is truncated at that position, or ErrCorrupt if the record
+// fails CRC validation.
+func (w *WAL) ReadAt(lsn LSN) (Record, error) {
+	segNo := lsn.GetSegmentNumber()
+	off := lsn.GetOffset()
+
+	path := filepath.Join(w.opts.Dir, segmentName(segNo))
+	entry, err := w.vfd.GetOrOpen(disk.FileNode{Path: path}, os.O_RDWR)
+	if err != nil {
+		return Record{}, fmt.Errorf("%w: open segment %d: %v", ErrBadLSN, segNo, err)
+	}
+	defer w.vfd.Release(entry)
+
+	// Read header.
+	hdr := make([]byte, RecordHeaderSize)
+	n, err := entry.ReadAt(hdr, int64(off))
+	if err == io.EOF && n == 0 {
+		return Record{}, fmt.Errorf("%w: lsn %v past end of segment", ErrBadLSN, lsn)
+	}
+	if err != nil && err != io.EOF {
+		return Record{}, err
+	}
+	if n < RecordHeaderSize {
+		return Record{}, fmt.Errorf("%w: short header at %v", ErrShortRead, lsn)
+	}
+
+	totalLen, err := PeekRecordLen(hdr)
+	if err != nil {
+		return Record{}, err
+	}
+
+	// Read full record.
+	buf := make([]byte, totalLen)
+	copy(buf, hdr)
+	if totalLen > RecordHeaderSize {
+		n, err = entry.ReadAt(buf[RecordHeaderSize:], int64(off)+int64(RecordHeaderSize))
+		if err != nil && err != io.EOF {
+			return Record{}, err
+		}
+		if n < int(totalLen)-RecordHeaderSize {
+			return Record{}, fmt.Errorf("%w: short body at %v", ErrShortRead, lsn)
+		}
+	}
+
+	var rec Record
+	if _, err := rec.Unmarshal(buf); err != nil {
+		return Record{}, err
+	}
+	// Sanity: the LSN stored in the record must match where we found it.
+	if rec.LSN != lsn {
+		return Record{}, fmt.Errorf("%w: record at %v reports LSN %v",
+			ErrCorrupt, lsn, rec.LSN)
+	}
+	return rec, nil
+}
+
 // -----------------------------------------------------------------------------
 // Sync
 // -----------------------------------------------------------------------------
