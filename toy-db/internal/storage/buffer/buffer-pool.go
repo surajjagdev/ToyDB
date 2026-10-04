@@ -9,6 +9,7 @@ import (
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
 const (
@@ -37,9 +38,15 @@ type FramePartition struct {
 	evictable chan struct{}
 }
 
+type LogFlusher interface {
+	FlushUpTo(lsn wal.LSN) error
+}
+
 // we hold a number of different frame partitions
 type BufferPool struct {
 	diskManager disk.DiskManager
+
+	wal LogFlusher
 
 	numPartitions common.PartitionIndex // number of partitions in the buffer pool
 
@@ -75,7 +82,10 @@ func NewFramePartition(numFrames common.FrameIndex) (*FramePartition, error) {
 	return fp, nil
 }
 
-func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionIndex, numFrames common.FrameIndex) (*BufferPool, error) {
+func NewBufferPool(diskManager disk.DiskManager,
+	wal LogFlusher,
+	numPartitions common.PartitionIndex,
+	numFrames common.FrameIndex) (*BufferPool, error) {
 
 	if numPartitions <= 0 {
 		return nil, fmt.Errorf("numPartitions must be greater than 0")
@@ -99,6 +109,7 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 
 	return &BufferPool{
 		diskManager:    diskManager,
+		wal:            wal,
 		numPartitions:  numPartitions,
 		partitions:     partitions,
 		isShuttingDown: atomic.Bool{},
@@ -115,6 +126,16 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 func (bp *BufferPool) writePageOut(frame *Frame) error {
 	frame.WLatch()
 	defer frame.WUnlatch()
+
+	// Write-ahead rule: the WAL must be durable up to the page's pageLSN
+	// before the page is written to disk. Otherwise a crash could leave
+	// the page on disk reflecting a WAL record that never made it.
+	pageLSN := frame.Page.GetLSN()
+	if pageLSN != 0 {
+		if err := bp.wal.FlushUpTo(pageLSN); err != nil {
+			return fmt.Errorf("write-ahead flush failed: %w", err)
+		}
+	}
 
 	frame.Page.UpdateChecksum()
 

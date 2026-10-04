@@ -11,7 +11,12 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/storage/buffer"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
 	"github.com/surajjagdev/ToyDB/internal/types"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
+
+type testLogFlusherHeap struct{}
+
+func (testLogFlusherHeap) FlushUpTo(lsn wal.LSN) error { return nil }
 
 func setupTableHeap(t *testing.T, partitions common.PartitionIndex, framesPerPartition common.FrameIndex) (*TableHeap, *buffer.BufferPool) {
 	t.Helper()
@@ -21,7 +26,7 @@ func setupTableHeap(t *testing.T, partitions common.PartitionIndex, framesPerPar
 		t.Fatalf("Failed to create DirectManager: %v", err)
 	}
 
-	bp, err := buffer.NewBufferPool(dm, partitions, framesPerPartition)
+	bp, err := buffer.NewBufferPool(dm, testLogFlusherHeap{}, partitions, framesPerPartition)
 	if err != nil {
 		t.Fatalf("Failed to create BufferPool: %v", err)
 	}

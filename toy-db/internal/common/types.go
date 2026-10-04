@@ -39,10 +39,6 @@ type TransactionID uint32
 // Defined in: internal/common/types.go
 type CommandID uint32
 
-// Log seq number is u64 (8 bytes).
-// Defined in: internal/common/types.go
-type LogSeqNumber uint64
-
 type FrameIndex uint32
 type PartitionIndex uint32
 
