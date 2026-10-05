@@ -53,36 +53,68 @@ func TestFIFOFairness(t *testing.T) {
 	m := NewLockManager(2*time.Second, nil)
 	row := testRow()
 
-	// Tx 1 holds exclusive.
+	// Tx1 holds exclusive.
 	if err := m.Acquire(context.Background(), 1, row, LockExclusive); err != nil {
 		t.Fatal(err)
 	}
 
-	var order []common.TransactionID
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		order []common.TransactionID
+	)
 
-	// Tx 2, 3, 4 queue in order.
-	for _, id := range []common.TransactionID{2, 3, 4} {
+	// enqueueWaiter starts a goroutine that acquires the lock, records the
+	// order in which it was granted, holds briefly, and releases. It waits
+	// until the waiter is actually in the queue before returning, so the
+	// caller can serialize enqueue order deterministically.
+	enqueueWaiter := func(id common.TransactionID) {
 		wg.Add(1)
-		go func(id common.TransactionID) {
+		go func() {
 			defer wg.Done()
 			if err := m.Acquire(context.Background(), id, row, LockExclusive); err != nil {
-				t.Errorf("tx %d: %v", id, err)
+				t.Errorf("Acquire(%d): %v", id, err)
 				return
 			}
 			mu.Lock()
 			order = append(order, id)
 			mu.Unlock()
-			// Hold briefly so the next one has to wait.
 			time.Sleep(20 * time.Millisecond)
 			m.Release(id, row)
-		}(id)
+		}()
+
+		// Wait until this txid appears in the row's wait queue.
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			m.mu.Lock()
+			entry := m.table[row]
+			found := false
+			if entry != nil {
+				for _, w := range entry.waitQueue {
+					if w.txid == id {
+						found = true
+						break
+					}
+				}
+			}
+			m.mu.Unlock()
+			if found {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("tx %d never appeared in the wait queue", id)
 	}
 
-	// Let the queue fill.
-	time.Sleep(30 * time.Millisecond)
+	// Enqueue waiters in a strictly controlled order.
+	enqueueWaiter(2)
+	enqueueWaiter(3)
+	enqueueWaiter(4)
+
+	// Release Tx1 so the queue starts draining.
 	m.Release(1, row)
+
+	// Wait for all three to complete.
 	wg.Wait()
 
 	want := []common.TransactionID{2, 3, 4}
@@ -93,6 +125,41 @@ func TestFIFOFairness(t *testing.T) {
 		if order[i] != want[i] {
 			t.Fatalf("FIFO violated: got %v want %v", order, want)
 		}
+	}
+}
+
+func TestPromoteIsFIFO(t *testing.T) {
+	m := NewLockManager(time.Second, nil)
+	row := testRow()
+
+	// Manually construct a queue with three exclusive waiters.
+	m.mu.Lock()
+	entry := &lockEntry{holders: map[common.TransactionID]LockMode{1: LockExclusive}}
+	w2 := &waiter{txid: 2, mode: LockExclusive, done: make(chan error, 1)}
+	w3 := &waiter{txid: 3, mode: LockExclusive, done: make(chan error, 1)}
+	w4 := &waiter{txid: 4, mode: LockExclusive, done: make(chan error, 1)}
+	entry.waitQueue = []*waiter{w2, w3, w4}
+	m.table[row] = entry
+	m.mu.Unlock()
+
+	// Release the holder; only the first waiter should be promoted.
+	m.Release(1, row)
+
+	select {
+	case <-w2.done:
+		// correct
+	default:
+		t.Fatal("w2 not promoted first")
+	}
+	select {
+	case <-w3.done:
+		t.Fatal("w3 promoted before w2 released")
+	default:
+	}
+	select {
+	case <-w4.done:
+		t.Fatal("w4 promoted before w2 released")
+	default:
 	}
 }
 
