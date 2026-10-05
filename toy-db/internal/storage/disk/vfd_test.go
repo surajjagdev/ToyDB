@@ -178,12 +178,12 @@ func TestGetOrOpen_LRU_MoveToFront(t *testing.T) {
 	cache.GetOrOpen(fn1, os.O_RDWR|os.O_CREATE)
 
 	// LRU order should now be: fn1 (MRU), fn3, fn2 (LRU)
-	front := cache.lruList.Front().Value.(*vfdEntry)
+	front := cache.lruList.Front().Value.(*VfdEntry)
 	if front.fileNode.Path != fn1.Path {
 		t.Fatalf("front entry = %s, want %s", front.fileNode.Path, fn1.Path)
 	}
 
-	back := cache.lruList.Back().Value.(*vfdEntry)
+	back := cache.lruList.Back().Value.(*VfdEntry)
 	if back.fileNode.Path != fn2.Path {
 		t.Fatalf("back entry = %s, want %s", back.fileNode.Path, fn2.Path)
 	}
@@ -241,7 +241,7 @@ func TestAcquire(t *testing.T) {
 	}
 
 	// Verify entry moved to front
-	frontEntry := cache.lruList.Front().Value.(*vfdEntry)
+	frontEntry := cache.lruList.Front().Value.(*VfdEntry)
 	if frontEntry != entry {
 		t.Error("entry should be at front after Acquire")
 	}

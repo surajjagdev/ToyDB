@@ -4,6 +4,7 @@ import (
 	"hash/crc32"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
 const (
@@ -75,11 +76,11 @@ func (p Page) zeroPageMemory() {
 // Header Accessors
 // -----------------------------------------------------------------------------
 
-func (p Page) GetLSN() common.LogSeqNumber {
-	return common.LogSeqNumber(common.ByteOrder.Uint64(p[OffsetPageLSN : OffsetPageLSN+8]))
+func (p Page) GetLSN() wal.LSN {
+	return wal.LSN(common.ByteOrder.Uint64(p[OffsetPageLSN : OffsetPageLSN+8]))
 }
 
-func (p Page) SetLSN(lsn common.LogSeqNumber) {
+func (p Page) SetLSN(lsn wal.LSN) {
 	common.ByteOrder.PutUint64(p[OffsetPageLSN:OffsetPageLSN+8], uint64(lsn))
 }
 

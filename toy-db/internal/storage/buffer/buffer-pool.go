@@ -9,10 +9,13 @@ import (
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
 const (
 	INVALID_IDX = ^(common.FrameIndex(0))
+
+	evictionWaitTimeout = 1 * time.Second
 )
 
 // To reduce contention, a frame partition holds a subset of frames
@@ -28,11 +31,22 @@ type FramePartition struct {
 	freeFrames []common.FrameIndex // indices of free frames
 
 	clockHand common.FrameIndex // index of the current frame in the frames slice
+
+	// evictable is closed and replaced whenever a frame's pin count or
+	// IO flag drops. Waiters capture the current channel under fp.mu,
+	// release, and select on it plus a timer.
+	evictable chan struct{}
+}
+
+type LogFlusher interface {
+	FlushUpTo(lsn wal.LSN) error
 }
 
 // we hold a number of different frame partitions
 type BufferPool struct {
 	diskManager disk.DiskManager
+
+	wal LogFlusher
 
 	numPartitions common.PartitionIndex // number of partitions in the buffer pool
 
@@ -45,26 +59,33 @@ func NewFramePartition(numFrames common.FrameIndex) (*FramePartition, error) {
 	frames := make([]*Frame, numFrames)
 	freeFrames := make([]common.FrameIndex, numFrames)
 
-	for i := common.FrameIndex(0); i < numFrames; i++ {
-		frame, err := NewFrame()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create frame: %v", err)
-		}
-		frames[i] = frame
-		freeFrames[i] = i
-	}
-
-	return &FramePartition{
+	fp := &FramePartition{
 		mu:         sync.RWMutex{},
 		frames:     frames,
 		numFrames:  numFrames,
 		frameMap:   make(map[BufferTag]common.FrameIndex),
 		freeFrames: freeFrames,
 		clockHand:  0,
-	}, nil
+		evictable:  make(chan struct{}),
+	}
+
+	for i := common.FrameIndex(0); i < numFrames; i++ {
+		frame, err := NewFrame()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create frame: %v", err)
+		}
+		frame.onEvictable = fp.notifyEvictable
+		frames[i] = frame
+		freeFrames[i] = i
+	}
+
+	return fp, nil
 }
 
-func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionIndex, numFrames common.FrameIndex) (*BufferPool, error) {
+func NewBufferPool(diskManager disk.DiskManager,
+	wal LogFlusher,
+	numPartitions common.PartitionIndex,
+	numFrames common.FrameIndex) (*BufferPool, error) {
 
 	if numPartitions <= 0 {
 		return nil, fmt.Errorf("numPartitions must be greater than 0")
@@ -88,6 +109,7 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 
 	return &BufferPool{
 		diskManager:    diskManager,
+		wal:            wal,
 		numPartitions:  numPartitions,
 		partitions:     partitions,
 		isShuttingDown: atomic.Bool{},
@@ -96,11 +118,24 @@ func NewBufferPool(diskManager disk.DiskManager, numPartitions common.PartitionI
 
 // Internal methods
 
-// Assume you have a write lock on the frame
-// Write the page out to disk
+// writePageOut flushes the frame's page to disk and clears the dirty bit.
+// It acquires the frame's write latch for the whole operation, so callers
+// must NOT already hold the frame latch, and it clears the dirty bit under
+// the same latch that observed the bytes (otherwise a concurrent writer
+// could re-dirty between the write and the clear).
 func (bp *BufferPool) writePageOut(frame *Frame) error {
 	frame.WLatch()
 	defer frame.WUnlatch()
+
+	// Write-ahead rule: the WAL must be durable up to the page's pageLSN
+	// before the page is written to disk. Otherwise a crash could leave
+	// the page on disk reflecting a WAL record that never made it.
+	pageLSN := frame.Page.GetLSN()
+	if pageLSN != 0 {
+		if err := bp.wal.FlushUpTo(pageLSN); err != nil {
+			return fmt.Errorf("write-ahead flush failed: %w", err)
+		}
+	}
 
 	frame.Page.UpdateChecksum()
 
@@ -118,6 +153,17 @@ func (bp *BufferPool) writePageOut(frame *Frame) error {
 	return nil
 }
 
+// notifyEvictable wakes anyone blocked in claimVictimFrame.
+// Must be called WITHOUT fp.mu held.
+// closing and re-opening channel notifies all watchers
+// and we have a bounded timeout
+func (fp *FramePartition) notifyEvictable() {
+	fp.mu.Lock()
+	close(fp.evictable)
+	fp.evictable = make(chan struct{})
+	fp.mu.Unlock()
+}
+
 // From internet, seems to be a good hash function for this use case
 // Given buffer tag, get a consistient index to the frame partition in buffer pool
 func (bp *BufferPool) getPartitionIndex(tag BufferTag) common.PartitionIndex {
@@ -133,12 +179,8 @@ func (bp *BufferPool) getPartitionIndex(tag BufferTag) common.PartitionIndex {
 }
 
 // Assumes you have a write lock on the frame partition
-func (fp *FramePartition) isFrameInFreeFrameList() bool {
-	if len(fp.freeFrames) > 0 {
-		return true
-	}
-
-	return false
+func (fp *FramePartition) freeFramesAvail() bool {
+	return len(fp.freeFrames) > 0
 }
 
 // Assumes you have a write lock on the frame partition
@@ -154,115 +196,182 @@ func (fp *FramePartition) popFreeFrame() (common.FrameIndex, bool) {
 	return frameIdx, true
 }
 
-// Assume you have a write lock on the frame partition and
-// that you have called `isFrameInFreeFrameList`
-func (fp *FramePartition) getLastFreeFrame() *Frame {
-	idx := fp.freeFrames[len(fp.freeFrames)-1]
+// claimVictimFrame runs the clock sweep to find a frame with no pins,
+// no IO in progress, and zero usage. If no victim is available, it waits
+// (bounded by evictionWaitTimeout) for an Unpin/StopIO to make one
+// available, then re-checks whether the tag we want appeared in the map
+// while we were blocked. Returns (frame, idx, true, nil) on success, or
+// (nil, INVALID_IDX, false, nil) if the caller should retry the fast path
+//
+// Caller must hold fp.mu as a WRITE lock.
+func (bp *BufferPool) claimVictimFrame(
+	fp *FramePartition,
+	tag BufferTag,
+) (*Frame, common.FrameIndex, bool, error) {
 
-	return fp.frames[idx]
-}
-
-// Assume you have a write lock on the frame partition
-// get a victim frame
-func (fp *FramePartition) getVictimFrame() (*Frame, common.FrameIndex, error) {
 	n := fp.numFrames
+	deadline := time.Now().Add(evictionWaitTimeout)
 
-	for i := common.FrameIndex(0); i < (n * 2); i++ {
-		idx := fp.clockHand
-		frame := fp.frames[idx]
+	for {
+		// Capture evictable BEFORE sweeping, so a signal that fires
+		// during the sweep is not lost.
+		ch := fp.evictable
 
-		fp.clockHand = (fp.clockHand + 1) % n
+		for i := common.FrameIndex(0); i < (n * 2); i++ {
+			idx := fp.clockHand
+			frame := fp.frames[idx]
+			fp.clockHand = (fp.clockHand + 1) % n
 
-		if frame.IsPinned() {
-			continue
+			if frame.IsPinned() {
+				continue
+			}
+			if !frame.TryStartIO() {
+				continue
+			}
+
+			if frame.GetUsage() > 0 {
+				frame.DecrementUsage()
+				// StopIO notifies eviction waiters and takes fp.mu,
+				// so it must run with fp.mu released.
+				fp.mu.Unlock()
+				frame.StopIO()
+				fp.mu.Lock()
+				continue
+			}
+
+			// We own the victim. recheck
+			if _, exists := fp.frameMap[tag]; exists {
+				fp.mu.Unlock()
+				frame.StopIO()
+				fp.mu.Lock()
+				return nil, INVALID_IDX, false, nil
+			}
+
+			return frame, idx, true, nil
 		}
 
-		if !frame.TryStartIO() {
-			continue
+		if time.Now().After(deadline) {
+			return nil, INVALID_IDX, false, fmt.Errorf(
+				"no victim frames found within %s", evictionWaitTimeout)
 		}
 
-		usage := frame.GetUsage()
-		if usage > 0 {
-			frame.DecrementUsage()
-			frame.StopIO()
-			continue
+		fp.mu.Unlock()
+
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-ch:
+			timer.Stop()
+		case <-timer.C:
 		}
 
-		// we own frame now
-		return frame, idx, nil
+		fp.mu.Lock()
+
+		if time.Now().After(deadline) {
+			return nil, INVALID_IDX, false, fmt.Errorf(
+				"no victim frames found within %s", evictionWaitTimeout)
+		}
 	}
-
-	return nil, INVALID_IDX, fmt.Errorf("no victim frames found")
 }
 
-// Assume you have write lock on frame partition
-// evict a frame for reuse, looks in free list first
-func (bp *BufferPool) evictFrame(framePartition common.PartitionIndex) (*Frame, BufferTag, common.FrameIndex, error) {
+// evictFrame picks a victim frame (free list first, then clock sweep),
+// re-checks the map for `tag` after a wait, flushes the old contents if
+// dirty, and unhooks the old identity. The returned frame has its IO flag
+// set and is ready for the caller to install the new tag.
+//
+// Returns (frame, oldTag, idx, retryNeeded, err). If retryNeeded is true,
+// the caller must release fp.mu and retry the fast path: `tag` was
+// installed by another goroutine while we were waiting.
+//
+// Caller must hold fp.mu as a WRITE lock.
+func (bp *BufferPool) evictFrame(
+	framePartition common.PartitionIndex,
+	tag BufferTag,
+) (*Frame, BufferTag, common.FrameIndex, bool, error) {
+
 	fp := bp.partitions[framePartition]
 
 	var frame *Frame
 	var idx common.FrameIndex
-	var tag BufferTag
+	var oldTag BufferTag
 
 	// ----------------------------
-	// 1. pick frame
+	// 1. pick a frame
 	// ----------------------------
-	if fp.isFrameInFreeFrameList() {
-		frame = fp.getLastFreeFrame()
-		var ok bool
-		idx, ok = fp.popFreeFrame()
-		if !ok {
-			return nil, BufferTag{}, INVALID_IDX, fmt.Errorf("free frame pop failed")
+	if fp.freeFramesAvail() {
+		var popOk bool
+		idx, popOk = fp.popFreeFrame()
+		if !popOk {
+			return nil, BufferTag{}, INVALID_IDX, false,
+				fmt.Errorf("free frame pop failed")
 		}
-	} else {
-		resFrame, frameIdx, err := fp.getVictimFrame()
-		if err != nil {
-			return nil, BufferTag{}, INVALID_IDX, err
-		}
-		frame = resFrame
-		idx = frameIdx
-	}
+		frame = fp.frames[idx]
 
-	// ----------------------------
-	// 2. MUST already own IO
-	// ----------------------------
-	// (victim already has IO; free-frame must also have it)
-	if !frame.IsIOInProgress() {
+		if _, exists := fp.frameMap[tag]; exists {
+			fp.freeFrames = append(fp.freeFrames, idx)
+			return nil, BufferTag{}, INVALID_IDX, true, nil
+		}
+
+		// Fresh frame — claim IO now, since claimVictimFrame (which
+		// does it on the other path) isn't called here.
 		if !frame.TryStartIO() {
-			return nil, BufferTag{}, INVALID_IDX, fmt.Errorf("failed to claim IO for eviction")
+			fp.freeFrames = append(fp.freeFrames, idx)
+			return nil, BufferTag{}, INVALID_IDX, false,
+				fmt.Errorf("failed to claim IO for free frame")
 		}
+
+		// Free frames carry the zero tag and are not valid/dirty.
+		oldTag = frame.GetFrameIdentity()
+
+		// Publish the tag and clear valid, same as the victim path.
+		frame.ClearValid()
+		fp.frameMap[tag] = idx
+
+		return frame, oldTag, idx, false, nil
 	}
 
 	// ----------------------------
-	// 3. read identity
+	// 2. victim path
 	// ----------------------------
-	frame.RLatch()
-	tag = frame.GetFrameIdentity()
-	frame.RUnlatch()
-
-	// IMPORTANT: remove from map BEFORE IO
-	delete(fp.frameMap, tag)
-
-	// ----------------------------
-	// 4. flush if needed
-	// ----------------------------
-	if frame.IsDirty() && frame.IsValid() {
-		fp.mu.Unlock()
-
-		err := bp.writePageOut(frame)
-
-		fp.mu.Lock()
-
-		if err != nil {
-			frame.StopIO()
-			return nil, BufferTag{}, INVALID_IDX, fmt.Errorf("failed to flush dirty page: %w", err)
-		}
+	var claimOk bool
+	var err error
+	frame, idx, claimOk, err = bp.claimVictimFrame(fp, tag)
+	if err != nil {
+		return nil, BufferTag{}, INVALID_IDX, false, err
+	}
+	if !claimOk {
+		return nil, BufferTag{}, INVALID_IDX, true, nil
 	}
 
+	// claimVictimFrame guarantees the IO flag is set.
+	oldTag = frame.GetFrameIdentity()
+	oldDirty := frame.IsDirty() && frame.IsValid()
+
+	// Publish BEFORE releasing fp.mu for the flush. This is the whole
+	// fix: concurrent GetPage(tag) will find frameMap[tag] and WaitIO
+	// instead of claiming a second victim.
+	delete(fp.frameMap, oldTag)
+	fp.frameMap[tag] = idx
 	frame.ClearValid()
 
-	// caller still owns IO lock + frame
-	return frame, tag, idx, nil
+	if oldDirty {
+		fp.mu.Unlock()
+
+		// writePageOut uses frame.GetFrameIdentity() → still oldTag
+		// (we haven't called SetFrameIdentity yet), so it flushes the
+		// old contents to the old location. Correct.
+		flushErr := bp.writePageOut(frame)
+
+		fp.mu.Lock()
+		if flushErr != nil {
+			// Roll back the install. frame.bufferTag was never changed.
+			delete(fp.frameMap, tag)
+			frame.StopIO()
+			return nil, BufferTag{}, INVALID_IDX, false,
+				fmt.Errorf("failed to flush dirty page: %w", flushErr)
+		}
+	}
+
+	return frame, oldTag, idx, false, nil
 }
 
 func (bp *BufferPool) getPageFromCache(framePartition *FramePartition, tag BufferTag) (*Frame, error, bool) {
@@ -329,19 +438,10 @@ retry:
 
 	framePartition.mu.Lock()
 
-	fmt.Printf(
-		"DOUBLE CHECK tag=%+v partition=%d map=%p len=%d\n",
-		tag,
-		partitionIdx,
-		framePartition.frameMap,
-		len(framePartition.frameMap),
-	)
-
 	// ----------------------------
-	// 2. double check
+	// 2. double check (Postgres: recheck after lock)
 	// ----------------------------
-	frameIdx, ok := framePartition.frameMap[tag]
-	if ok {
+	if frameIdx, ok := framePartition.frameMap[tag]; ok {
 		frame := framePartition.frames[frameIdx]
 
 		if !frame.Pin() {
@@ -364,16 +464,23 @@ retry:
 	}
 
 	// ----------------------------
-	// 3. eviction
+	// 3. eviction (may block, bounded)
 	// ----------------------------
-	frame, _, frameIdx, err = bp.evictFrame(partitionIdx)
+	frame, _, _, retryNeeded, err := bp.evictFrame(partitionIdx, tag)
 	if err != nil {
 		framePartition.mu.Unlock()
 		return nil, err, false
 	}
+	if retryNeeded {
+		// Another goroutine installed `tag` while we were waiting
+		// for a victim. Go back to the double-check and take the
+		// map path — do NOT install a second frame for the same tag.
+		framePartition.mu.Unlock()
+		goto retry
+	}
 
 	// ----------------------------
-	// 4. initialize frame
+	// 4. initialize frame (fp.mu still held — install is atomic)
 	// ----------------------------
 	frame.WLatch()
 	frame.SetFrameIdentity(tag.BlockID, tag.ForkID, tag.RelationID)
@@ -383,15 +490,13 @@ retry:
 		framePartition.mu.Unlock()
 		return nil, fmt.Errorf("failed to pin newly allocated frame"), false
 	}
-
-	frame.StartIO()
 	frame.IncrementUsage()
 
-	framePartition.frameMap[tag] = frameIdx
+	// unlock before io
 	framePartition.mu.Unlock()
 
 	// ----------------------------
-	// 5. disk read
+	// 5. disk read (no partition lock held)
 	// ----------------------------
 	err = bp.diskManager.ReadPage(
 		tag.RelationID,
@@ -410,22 +515,23 @@ retry:
 	// 6. finalize
 	// ----------------------------
 	framePartition.mu.Lock()
-	defer framePartition.mu.Unlock()
+	if err != nil {
+		delete(framePartition.frameMap, tag)
+	} else {
+		frame.SetValid()
+	}
+	framePartition.mu.Unlock()
 
+	// StopIO outside the partition lock: it notifies eviction waiters.
 	frame.StopIO()
 
 	if err != nil {
-		frame.ClearValid()
+		// Error path: we own the pin we took in step 4, so release it.
 		frame.Unpin()
-
-		delete(framePartition.frameMap, tag)
-		//framePartition.freeFrames = append(framePartition.freeFrames, frameIdx)
-
 		return nil, err, false
 	}
 
-	frame.SetValid()
-
+	// Success path: frame stays pinned for the caller.
 	return frame, nil, false
 }
 
@@ -521,22 +627,30 @@ func (bp *BufferPool) AllocatePage(tag BufferTag) (*Frame, error) {
 	// Lock partition
 	framePartition.mu.Lock()
 
-	// 1. Double check: Make sure it's not somehow already in memory
+	// Double check: Make sure it's not somehow already in memory
 	if _, ok := framePartition.frameMap[tag]; ok {
 		framePartition.mu.Unlock()
 		return nil, fmt.Errorf("page already exists in buffer pool")
 	}
 
-	frame, _, frameIdx, err := bp.evictFrame(partionId)
+	frame, _, _, retryNeeded, err := bp.evictFrame(partionId, tag)
 	if err != nil {
 		framePartition.mu.Unlock()
 		return nil, err
 	}
+	if retryNeeded {
+		framePartition.mu.Unlock()
+		return nil, fmt.Errorf("page already exists in buffer pool")
+	}
 
 	// 3. Initialize the frame for the new block
+	// evictFrame already installed tag in frameMap and cleared valid.
+	// Just initialize in place.
 	frame.WLatch()
 	frame.SetFrameIdentity(tag.BlockID, tag.ForkID, tag.RelationID)
 	frame.Page.ResetPage(0)
+	frame.SetValid()
+	frame.SetDirty()
 	frame.WUnlatch()
 
 	if !frame.Pin() {
@@ -545,13 +659,9 @@ func (bp *BufferPool) AllocatePage(tag BufferTag) (*Frame, error) {
 	}
 
 	frame.IncrementUsage()
-	frame.SetValid()
-	frame.SetDirty() // set dirty so its written to disk
-
-	// Add to map
-	framePartition.frameMap[tag] = frameIdx
 	framePartition.mu.Unlock()
 
+	// StopIO notifies eviction waiters — must be outside the partition lock.
 	frame.StopIO()
 
 	return frame, nil
@@ -598,10 +708,11 @@ func (bp *BufferPool) FlushPage(tag BufferTag) error {
 	var err error = nil
 
 	if frame.IsDirty() {
+		// writePageOut now clears the dirty bit under its own latch.
 		err = bp.writePageOut(frame)
 	}
 
-	// release io and unpin
+	// release io and unpin (outside the partition lock: both notify waiters)
 	frame.StopIO()
 	frame.Unpin()
 
@@ -612,57 +723,42 @@ func (bp *BufferPool) FlushPage(tag BufferTag) error {
 func (bp *BufferPool) FlushAllPages() error {
 	var firstError error = nil
 
-	// Loop through all partitions,
-	// lock partition and check every frame in partition
-	// if frame is dirty, if so write to disk
 	for i := common.PartitionIndex(0); i < bp.numPartitions; i++ {
-		framePartition := bp.partitions[i]
-		framePartition.mu.RLock()
+		fp := bp.partitions[i]
 
-		for _, frameIdx := range framePartition.frameMap {
-			frame := framePartition.frames[frameIdx]
-
+		// Snapshot dirty frames under the partition lock so a concurrent
+		// map mutation cannot invalidate our iteration.
+		fp.mu.RLock()
+		dirty := make([]*Frame, 0, len(fp.frameMap))
+		for _, frameIdx := range fp.frameMap {
+			frame := fp.frames[frameIdx]
 			if frame.IsDirty() {
-				// pin the frame
-				if !frame.Pin() {
-					err := fmt.Errorf("failed to pin frame")
-
-					if firstError == nil {
-						firstError = err
-					}
-
-					continue
-				}
-
-				// frame is pinned, write to disk.
-				// unlock the frame partition for
-				// slow disk operation
-				framePartition.mu.RUnlock()
-
-				// wait for prev IO to complete, then
-				// mark as started IO
-				frame.WaitIO()
-				frame.StartIO()
-
-				// write to disk, but check for
-				// frame still being dirty
-				if frame.IsDirty() {
-					err := bp.writePageOut(frame)
-
-					if err != nil && firstError == nil {
-						firstError = err
-					}
-				}
-
-				frame.StopIO()
-				frame.Unpin()
-
-				// re-lock the frame partition
-				framePartition.mu.RLock()
+				dirty = append(dirty, frame)
 			}
 		}
+		fp.mu.RUnlock()
 
-		framePartition.mu.RUnlock()
+		for _, frame := range dirty {
+			if !frame.Pin() {
+				if firstError == nil {
+					firstError = fmt.Errorf("failed to pin frame during flush")
+				}
+				continue
+			}
+
+			frame.WaitIO()
+			frame.StartIO()
+
+			if frame.IsDirty() {
+				// writePageOut clears the dirty bit under its own latch.
+				if err := bp.writePageOut(frame); err != nil && firstError == nil {
+					firstError = err
+				}
+			}
+
+			frame.StopIO()
+			frame.Unpin()
+		}
 	}
 
 	return firstError

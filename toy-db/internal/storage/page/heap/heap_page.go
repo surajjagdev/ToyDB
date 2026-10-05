@@ -88,6 +88,12 @@ type HeapPage struct {
 	page.Page
 }
 
+type TupleHeader struct {
+	XMin common.TransactionID
+	XMax common.TransactionID // 0 = live
+	Cid  common.CommandID
+}
+
 // Assuming page already alloc'ed, set the
 // page header and flags
 func InitHeapPage(p page.Page) *HeapPage {
@@ -139,6 +145,39 @@ func (h *HeapPage) validateSlot(slot common.SlotIndex) bool {
 	}
 
 	return true
+}
+
+// GetTupleHeader reads the MVCC header for the tuple in the given slot.
+//
+// Callers must hold at least a read latch on the page. The returned header
+// is a value copy; it does not alias the page buffer.
+//
+// Returns an error if the slot does not point at a live tuple, or if the
+// tuple is too small to hold a header (corruption).
+func (h *HeapPage) GetTupleHeader(slot common.SlotIndex) (TupleHeader, error) {
+	if !h.DoesTupleInSlotExist(slot) {
+		return TupleHeader{}, fmt.Errorf("no tuple in slot %d", slot)
+	}
+
+	raw := h.GetTupleWithSlot(slot)
+	if len(raw) < HeapTupleHeaderMinSize {
+		return TupleHeader{}, fmt.Errorf(
+			"tuple in slot %d too small for header: %d < %d",
+			slot, len(raw), HeapTupleHeaderMinSize,
+		)
+	}
+
+	return TupleHeader{
+		XMin: common.TransactionID(
+			common.ByteOrder.Uint32(raw[TupleHeaderOffsetXmin : TupleHeaderOffsetXmin+4]),
+		),
+		XMax: common.TransactionID(
+			common.ByteOrder.Uint32(raw[TupleHeaderOffsetXmax : TupleHeaderOffsetXmax+4]),
+		),
+		Cid: common.CommandID(
+			common.ByteOrder.Uint32(raw[TupleHeaderOffsetCid : TupleHeaderOffsetCid+4]),
+		),
+	}, nil
 }
 
 func (h *HeapPage) GetNumSlots() int {
@@ -311,6 +350,42 @@ func (h *HeapPage) InsertTuple(
 	}, nil
 }
 
+// In internal/storage/page/heap/heap.go:
+
+// CanDeleteTuple reports whether DeleteTuple would succeed for the given
+// slot, without mutating anything. Callers can use it to fail before writing
+// a WAL record, keeping losing transactions' undo chains empty.
+func (h *HeapPage) CanDeleteTuple(slot common.SlotIndex) error {
+	if !h.validateSlot(slot) {
+		return fmt.Errorf("invalid slot %d", slot)
+	}
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	switch flags {
+	case ItemIdFlagUnused:
+		return fmt.Errorf("tuple already removed")
+	case ItemIdDeleted:
+		return fmt.Errorf("tuple already deleted")
+	case ItemIdRedirect:
+		return fmt.Errorf("cannot delete redirect slot")
+	case ItemIdFlagNormal:
+		// ok
+	default:
+		return fmt.Errorf("unknown itemId flag")
+	}
+
+	tuple := h.Page[tupleOffset : tupleOffset+size]
+	oldXmax := common.ByteOrder.Uint32(
+		tuple[TupleHeaderOffsetXmax : TupleHeaderOffsetXmax+4],
+	)
+	if oldXmax != 0 {
+		return fmt.Errorf("tuple already deleted by txn id %v", oldXmax)
+	}
+	return nil
+}
+
 // Logical Deletion of tuple from page
 func (h *HeapPage) DeleteTuple(
 	slot common.SlotIndex,
@@ -372,4 +447,20 @@ func (h *HeapPage) DeleteTuple(
 	// 4. Update infomask (future)
 
 	return nil
+}
+
+func (h *HeapPage) NextSlot() (common.SlotIndex, error) {
+	lower := h.GetLower()
+
+	// The slot array grows upward from PageHeaderSize. The slot that the
+	// next insert will claim sits right at the current lower pointer.
+	slotIndex := (lower - page.PageHeaderSize) / ItemIdSize
+
+	// The new slot must not collide with tuple data. If it does, the page
+	// has no room for a new ItemId, let alone the tuple itself.
+	if int(lower)+ItemIdSize > int(h.GetUpper()) {
+		return 0, fmt.Errorf("page has no room for a new slot")
+	}
+
+	return common.SlotIndex(slotIndex), nil
 }
