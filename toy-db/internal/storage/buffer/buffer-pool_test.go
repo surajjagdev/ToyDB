@@ -886,3 +886,221 @@ func TestBufferPool_WriteAheadRule_MixedLSNs(t *testing.T) {
 		t.Errorf("highest flushed LSN %v < max pageLSN %v", gotLSN, maxLSN)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// recLSN / DirtyPageTable
+// -----------------------------------------------------------------------------
+
+func TestRecLSNSetOnFirstDirty(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 2)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(1)
+	fork := common.ForkID(0)
+	b1, _ := dm.AllocateBlock(rel, fork)
+	writePage(t, dm, rel, fork, b1)
+
+	tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	frame, err := bp.AllocatePage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	// A fresh frame has recLSN == 0 (AllocatePage dirties it without a
+	// backing WAL record).
+	if got := frame.RecLSN(); got != 0 {
+		t.Fatalf("initial recLSN = %v, want 0", got)
+	}
+
+	lsn := wal.MakeLSN(5, 100)
+	bp.MarkDirtyWithLSN(frame, lsn)
+
+	if got := frame.RecLSN(); got != lsn {
+		t.Errorf("recLSN = %v, want %v", got, lsn)
+	}
+}
+
+func TestRecLSNKeepsMinimum(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 2)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(1)
+	fork := common.ForkID(0)
+	b1, _ := dm.AllocateBlock(rel, fork)
+	writePage(t, dm, rel, fork, b1)
+
+	tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	frame, err := bp.AllocatePage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	first := wal.MakeLSN(5, 100)
+	later := wal.MakeLSN(5, 500)
+	earlier := wal.MakeLSN(5, 50)
+
+	bp.MarkDirtyWithLSN(frame, first)
+	if got := frame.RecLSN(); got != first {
+		t.Fatalf("after first: recLSN = %v, want %v", got, first)
+	}
+
+	// A later LSN must not lower the recorded recLSN.
+	bp.MarkDirtyWithLSN(frame, later)
+	if got := frame.RecLSN(); got != first {
+		t.Errorf("after later: recLSN = %v, want %v (should not increase)", got, first)
+	}
+
+	// An earlier LSN must lower it (defensive — shouldn't happen in
+	// production, but the invariant should hold).
+	bp.MarkDirtyWithLSN(frame, earlier)
+	if got := frame.RecLSN(); got != earlier {
+		t.Errorf("after earlier: recLSN = %v, want %v", got, earlier)
+	}
+}
+
+func TestRecLSNClearedOnFlush(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 2)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(1)
+	fork := common.ForkID(0)
+	b1, _ := dm.AllocateBlock(rel, fork)
+	writePage(t, dm, rel, fork, b1)
+
+	tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	frame, err := bp.AllocatePage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lsn := wal.MakeLSN(5, 100)
+	frame.WLatch()
+	frame.Page.SetLSN(lsn)
+	frame.WUnlatch()
+	bp.MarkDirtyWithLSN(frame, lsn)
+
+	if got := frame.RecLSN(); got != lsn {
+		t.Fatalf("recLSN before flush = %v, want %v", got, lsn)
+	}
+	frame.Unpin()
+
+	if err := bp.FlushPage(tag); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := frame.RecLSN(); got != 0 {
+		t.Errorf("recLSN after flush = %v, want 0", got)
+	}
+}
+
+func TestDirtyPageTableSnapshot(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 4)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(1)
+	fork := common.ForkID(0)
+
+	type expect struct {
+		block common.BlockID
+		lsn   wal.LSN
+	}
+	cases := []expect{
+		{lsn: wal.MakeLSN(1, 100)},
+		{lsn: wal.MakeLSN(1, 200)},
+		{lsn: wal.MakeLSN(2, 50)},
+	}
+
+	for i := range cases {
+		b, _ := dm.AllocateBlock(rel, fork)
+		writePage(t, dm, rel, fork, b)
+		cases[i].block = b
+
+		tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b}
+		frame, err := bp.AllocatePage(tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bp.MarkDirtyWithLSN(frame, cases[i].lsn)
+		frame.Unpin()
+	}
+
+	dpt := bp.DirtyPageTable()
+	if len(dpt) != len(cases) {
+		t.Fatalf("DPT has %d entries, want %d", len(dpt), len(cases))
+	}
+
+	byBlock := make(map[common.BlockID]wal.LSN, len(dpt))
+	for _, e := range dpt {
+		byBlock[e.Tag.BlockID] = e.RecLSN
+	}
+	for _, c := range cases {
+		got, ok := byBlock[c.block]
+		if !ok {
+			t.Errorf("block %d missing from DPT", c.block)
+			continue
+		}
+		if got != c.lsn {
+			t.Errorf("block %d: recLSN = %v, want %v", c.block, got, c.lsn)
+		}
+	}
+}
+
+func TestDirtyPageTableExcludesClean(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 4)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(1)
+	fork := common.ForkID(0)
+	b1, _ := dm.AllocateBlock(rel, fork)
+	writePage(t, dm, rel, fork, b1)
+
+	tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	frame, err := bp.AllocatePage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lsn := wal.MakeLSN(1, 100)
+	frame.WLatch()
+	frame.Page.SetLSN(lsn)
+	frame.WUnlatch()
+	bp.MarkDirtyWithLSN(frame, lsn)
+	frame.Unpin()
+
+	if got := len(bp.DirtyPageTable()); got != 1 {
+		t.Fatalf("DPT after dirtying = %d, want 1", got)
+	}
+
+	if err := bp.FlushPage(tag); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(bp.DirtyPageTable()); got != 0 {
+		t.Errorf("DPT after flush = %d, want 0", got)
+	}
+}
+
+func TestDirtyPageTableExcludesZeroRecLSN(t *testing.T) {
+	bp, dm := setupBufferPool(t, 1, 4)
+	defer bp.Shutdown()
+
+	rel := common.RelationID(1)
+	fork := common.ForkID(0)
+	b1, _ := dm.AllocateBlock(rel, fork)
+	writePage(t, dm, rel, fork, b1)
+
+	tag := BufferTag{RelationID: rel, ForkID: fork, BlockID: b1}
+	frame, err := bp.AllocatePage(tag) // dirties without a WAL record
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame.Unpin()
+
+	// AllocatePage leaves recLSN at 0, so the DPT must not include this
+	// frame even though it is dirty.
+	if got := len(bp.DirtyPageTable()); got != 0 {
+		t.Errorf("DPT should exclude zero-recLSN frames, got %d entries", got)
+	}
+}

@@ -22,35 +22,72 @@ type Snapshot struct {
 
 // Visible reports whether a tuple version with the given xmin/xmax is visible
 // to this snapshot.
-func (s *Snapshot) IsVisible(xmin, xmax common.TransactionID) bool {
-	// Deleted by a transaction that is committed in our view → invisible.
-	if xmax != 0 && s.committed(xmax) {
-		return false
+func (s *Snapshot) IsVisible(xmin, xmax common.TransactionID,
+	cid common.CommandID,
+	currentTxID common.TransactionID,
+	currentCID common.CommandID,
+	isoLevel IsolationLevel,
+	tm *TransactionManager) bool {
+	// ==========================================================
+	// RULE 1: Was the tuple created by a visible transaction?
+	// ==========================================================
+	if xmin == currentTxID {
+		if cid >= currentCID {
+			return false // Created during or after this statement began (Halloween Problem)
+		}
+	} else if isoLevel == SnapshotIsolation {
+		if !s.committedInSnapshot(xmin) {
+			return false
+		}
+	} else if isoLevel == ReadCommitted {
+		// ReadCommitted: Check real-time commit status
+		if !s.committedInSnapshot(xmin) {
+			if tm.GetTxnState(xmin) != Committed {
+				return false
+			}
+		}
 	}
 
-	// non-committed txn -> should be invisible
-	if !s.committed(xmin) {
+	// ==========================================================
+	// RULE 2: Was the tuple deleted/updated by a visible transaction?
+	// ==========================================================
+	if xmax == 0 {
+		return true // Never deleted
+	}
+
+	if xmax == currentTxID {
+		if cid >= currentCID {
+			return true // We just deleted it during this exact statement
+		}
+		return false // We deleted it in a previous statement
+	}
+
+	if isoLevel == SnapshotIsolation {
+		if s.committedInSnapshot(xmax) {
+			return false // Someone else deleted it before we started
+		}
+		return true // Someone is deleting it right now, or deleted it after we started. Ignore them!
+	}
+
+	// ReadCommitted: Has it committed in real-time?
+	if s.committedInSnapshot(xmax) {
 		return false
+	}
+	if tm.GetTxnState(xmax) == Committed {
+		return false // It died recently while our query was running!
 	}
 
 	return true
 }
 
-// committed reports whether txid is committed from the snapshot's perspective.
-// A txid is committed if it is below XMax and not in the InProgress set.
-func (s *Snapshot) committed(txid common.TransactionID) bool {
-	// current txn is after xmax of snapshot
+func (s *Snapshot) committedInSnapshot(txid common.TransactionID) bool {
+	if txid < s.XMin {
+		return true
+	}
 	if txid >= s.XMax {
 		return false
 	}
-
-	// search for txn in-progress, and if there return false
-	// bc its still possibly in-progress
-	if s.InProgressContains(txid) {
-		return false
-	}
-
-	return true
+	return !s.InProgressContains(txid)
 }
 
 // InProgressContains reports whether txid was in-flight at snapshot time.

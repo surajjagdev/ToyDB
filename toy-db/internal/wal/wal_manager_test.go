@@ -1,7 +1,9 @@
 package wal
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -779,5 +781,229 @@ func TestWALReadAtBadLSN(t *testing.T) {
 	// LSN in the middle of a record.
 	if _, err := w.ReadAt(MakeLSN(1, 5)); err == nil {
 		t.Error("ReadAt mid-record: expected error")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TruncateBefore
+// -----------------------------------------------------------------------------
+
+func TestWALTruncateBefore(t *testing.T) {
+	opts := testOptions(t)
+	opts.SegmentSize = 512 // tiny: forces rotation every few records
+	vfd := disk.NewCachedVFD(16)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// Write enough records to span several segments.
+	const n = 50
+	var lastLSN LSN
+	for i := 0; i < n; i++ {
+		rec := Record{Type: RecInsert, Data: bytes.Repeat([]byte{0xAB}, 100)}
+		lsn, err := w.Append(&rec)
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		lastLSN = lsn
+	}
+	if err := w.Sync(context.Background(), lastLSN); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := listAllSegments(opts.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) < 3 {
+		t.Fatalf("need at least 3 segments to test truncation, got %d", len(before))
+	}
+
+	// Truncate before the second segment. Everything below it (just the
+	// first segment) should be removed.
+	targetSeg := before[1]
+	if err := w.TruncateBefore(MakeLSN(targetSeg, 0)); err != nil {
+		t.Fatalf("TruncateBefore(%d): %v", targetSeg, err)
+	}
+
+	after, err := listAllSegments(opts.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before)-1 {
+		t.Fatalf("after truncate: %d segments, want %d", len(after), len(before)-1)
+	}
+	// The first segment must be gone.
+	for _, s := range after {
+		if s == before[0] {
+			t.Errorf("segment %d should have been removed", before[0])
+		}
+	}
+	// The target segment must remain.
+	found := false
+	for _, s := range after {
+		if s == targetSeg {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("target segment %d was incorrectly removed", targetSeg)
+	}
+}
+
+func TestWALTruncateBeforeNoOp(t *testing.T) {
+	opts := testOptions(t)
+	vfd := disk.NewCachedVFD(8)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// Zero LSN is always a no-op.
+	if err := w.TruncateBefore(0); err != nil {
+		t.Errorf("TruncateBefore(0): %v", err)
+	}
+
+	// Nothing below segment 1, so this is a no-op on a fresh WAL.
+	if err := w.TruncateBefore(MakeLSN(1, 0)); err != nil {
+		t.Errorf("TruncateBefore(1,0): %v", err)
+	}
+}
+
+func TestWALTruncateBeforeKeepsTargetSegment(t *testing.T) {
+	opts := testOptions(t)
+	opts.SegmentSize = 512
+	vfd := disk.NewCachedVFD(16)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 50; i++ {
+		rec := Record{Type: RecInsert, Data: bytes.Repeat([]byte{0xAB}, 100)}
+		lsn, _ := w.Append(&rec)
+		if err := w.Sync(context.Background(), lsn); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	segs, _ := listAllSegments(opts.Dir)
+	if len(segs) < 3 {
+		t.Skipf("need 3+ segments, got %d", len(segs))
+	}
+
+	// Truncate before the last segment. Everything except the last segment
+	// should be removed.
+	targetSeg := segs[len(segs)-1]
+	if err := w.TruncateBefore(MakeLSN(targetSeg, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := listAllSegments(opts.Dir)
+	if len(after) != 1 {
+		t.Errorf("expected 1 segment after truncate, got %d: %v", len(after), after)
+	}
+	if len(after) > 0 && after[0] != targetSeg {
+		t.Errorf("kept wrong segment: %d, want %d", after[0], targetSeg)
+	}
+}
+
+func TestWALTruncateBeforeKeepsActiveSegment(t *testing.T) {
+	opts := testOptions(t)
+	opts.SegmentSize = 512
+	vfd := disk.NewCachedVFD(16)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 20; i++ {
+		rec := Record{Type: RecInsert, Data: bytes.Repeat([]byte{0xAB}, 100)}
+		w.Append(&rec)
+	}
+	if err := w.Sync(context.Background(), w.LastLSN()); err != nil {
+		t.Fatal(err)
+	}
+
+	segs, _ := listAllSegments(opts.Dir)
+	if len(segs) < 2 {
+		t.Skipf("need 2+ segments, got %d", len(segs))
+	}
+
+	currentSeg := w.LastLSN().GetSegmentNumber()
+
+	// Truncate before the current segment. Everything older goes; the
+	// active segment must survive.
+	if err := w.TruncateBefore(MakeLSN(currentSeg, 0)); err != nil {
+		t.Fatalf("TruncateBefore(current=%d): %v", currentSeg, err)
+	}
+
+	after, _ := listAllSegments(opts.Dir)
+	found := false
+	for _, s := range after {
+		if s == currentSeg {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("active segment %d was removed", currentSeg)
+	}
+}
+
+func TestWALTruncateBeforeTargetBeyondCurrent(t *testing.T) {
+	opts := testOptions(t)
+	vfd := disk.NewCachedVFD(8)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// One record establishes the current segment.
+	rec := Record{Type: RecInsert, Data: []byte("x")}
+	if _, err := w.Append(&rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(context.Background(), w.LastLSN()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Target far past where we've written. Should error, not silently
+	// remove everything.
+	err = w.TruncateBefore(MakeLSN(1000, 0))
+	if err == nil {
+		t.Fatal("expected error for truncate target beyond current segment")
+	}
+	if !errors.Is(err, ErrBadLSN) {
+		t.Errorf("expected ErrBadLSN, got %v", err)
+	}
+}
+
+func TestWALTruncateBeforeAfterClose(t *testing.T) {
+	opts := testOptions(t)
+	vfd := disk.NewCachedVFD(8)
+
+	w, err := Open(vfd, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.TruncateBefore(MakeLSN(1, 0)); err != ErrClosed {
+		t.Errorf("TruncateBefore after Close: got %v, want ErrClosed", err)
 	}
 }

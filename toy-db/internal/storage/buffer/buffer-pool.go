@@ -18,6 +18,12 @@ const (
 	evictionWaitTimeout = 1 * time.Second
 )
 
+// DirtyPageEntry is a single entry in the DirtyPageTable snapshot.
+type DirtyPageEntry struct {
+	Tag    BufferTag
+	RecLSN wal.LSN
+}
+
 // To reduce contention, a frame partition holds a subset of frames
 type FramePartition struct {
 	mu sync.RWMutex // lock for the partition's map and clock hand
@@ -116,6 +122,51 @@ func NewBufferPool(diskManager disk.DiskManager,
 	}, nil
 }
 
+// MarkDirtyWithLSN marks the frame dirty and records the LSN of the WAL
+// record that caused the change. Callers must pass the LSN of the record
+// they just appended — the same LSN they set on the page via
+// page.SetLSN(lsn). Using a different LSN would break the invariant that
+// the page's pageLSN and its frame's recLSN refer to the same record.
+func (bp *BufferPool) MarkDirtyWithLSN(frame *Frame, lsn wal.LSN) {
+	frame.setRecLSN(lsn)
+	frame.SetDirty()
+}
+
+// DirtyPageTable returns a snapshot of every dirty frame's BufferTag and
+// recLSN. Used by the checkpoint manager to build a RecCheckpoint payload.
+//
+// The snapshot is point-in-time consistent as of this call, but pages may
+// become dirty or clean between this call and the checkpoint record being
+// written. Callers must serialize with the background flusher (or accept
+// that the table is a slight over-approximation of the dirty set at
+// checkpoint time — which is safe, since recovering extra pages is
+// idempotent).
+//
+// Frames with recLSN == 0 are excluded. Such frames are dirty but not
+// backed by a WAL record; they can happen when AllocatePage dirties a page
+// without logging. They will get a recLSN on their next heap write.
+func (bp *BufferPool) DirtyPageTable() []DirtyPageEntry {
+	var out []DirtyPageEntry
+	for _, p := range bp.partitions {
+		p.mu.RLock()
+		for _, frame := range p.frames {
+			if !frame.IsDirty() {
+				continue
+			}
+			lsn := frame.RecLSN()
+			if lsn == 0 {
+				continue
+			}
+			out = append(out, DirtyPageEntry{
+				Tag:    frame.GetFrameIdentity(),
+				RecLSN: lsn,
+			})
+		}
+		p.mu.RUnlock()
+	}
+	return out
+}
+
 // Internal methods
 
 // writePageOut flushes the frame's page to disk and clears the dirty bit.
@@ -150,6 +201,8 @@ func (bp *BufferPool) writePageOut(frame *Frame) error {
 	}
 
 	frame.ClearDirty()
+	frame.clearRecLSN()
+
 	return nil
 }
 

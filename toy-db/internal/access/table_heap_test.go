@@ -8,13 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/surajjagdev/ToyDB/internal/catalog"
+	"github.com/surajjagdev/ToyDB/internal/clog"
 	"github.com/surajjagdev/ToyDB/internal/common"
-	"github.com/surajjagdev/ToyDB/internal/lock"
 	"github.com/surajjagdev/ToyDB/internal/storage/buffer"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
+	"github.com/surajjagdev/ToyDB/internal/storage/page"
 	"github.com/surajjagdev/ToyDB/internal/storage/page/heap"
 	"github.com/surajjagdev/ToyDB/internal/transaction"
 	"github.com/surajjagdev/ToyDB/internal/types"
@@ -36,33 +36,25 @@ type testEnv struct {
 	heap   *TableHeap
 	bp     *buffer.BufferPool
 	tm     *transaction.TransactionManager
-	locks  *lock.Manager
 	wal    *wal.WAL
 	walDir string
 	vfd    *disk.VFDCache
+	clog   *clog.Manager
 }
 
 func (e *testEnv) Shutdown(t *testing.T) {
 	t.Helper()
 	_ = e.bp.Shutdown()
+	_ = e.clog.Close()
 	_ = e.wal.Close()
 	_ = os.RemoveAll(e.walDir)
 }
 
-// setupEnv creates a fresh buffer pool, WAL, lock manager, and transaction
-// manager backed by a temp directory. Used by every test in this file.
-func setupEnv(
-	t *testing.T,
-	partitions common.PartitionIndex,
-	framesPerPartition common.FrameIndex,
-) *testEnv {
+func setupEnv(t *testing.T, partitions common.PartitionIndex, framesPerPartition common.FrameIndex) *testEnv {
 	t.Helper()
 
 	dir := t.TempDir()
 
-	// Page I/O uses a direct VFD (page-aligned O_DIRECT is the default when
-	// using NewDirectManager). The WAL uses a separate buffered VFD because
-	// its writes are byte-level, not page-aligned.
 	dm, err := disk.NewDirectManager(dir, 100, 100)
 	if err != nil {
 		t.Fatalf("disk manager: %v", err)
@@ -73,12 +65,18 @@ func setupEnv(
 	w, err := wal.Open(walVFD, wal.Options{
 		Dir:         walDir,
 		SegmentSize: 1 << 20,
-		BatchWait:   1_000_000, // effectively never on the ticker
-		Fsync:       false,     // tests don't need durability
+		BatchWait:   1_000_000,
+		Fsync:       false,
 		Metrics:     wal.NopMetrics{},
 	})
 	if err != nil {
 		t.Fatalf("wal.Open: %v", err)
+	}
+
+	clogDir := dir + "/clog"
+	c, err := clog.Open(walVFD, clogDir)
+	if err != nil {
+		t.Fatalf("clog.Open: %v", err)
 	}
 
 	bp, err := buffer.NewBufferPool(dm, w, partitions, framesPerPartition)
@@ -86,8 +84,7 @@ func setupEnv(
 		t.Fatalf("buffer pool: %v", err)
 	}
 
-	locks := lock.NewLockManager(2_000_000_000, nil) // 2s wait in ns form
-	tm := transaction.NewManager(w, locks)
+	tm := transaction.NewManager(w, c)
 
 	rel := common.RelationID(1)
 	th := NewTableHeap(bp, NewFSM(bp), rel, tm)
@@ -96,14 +93,13 @@ func setupEnv(
 		heap:   th,
 		bp:     bp,
 		tm:     tm,
-		locks:  locks,
+		clog:   c,
 		wal:    w,
 		walDir: walDir,
 		vfd:    walVFD,
 	}
 }
 
-// beginTx is a small helper for tests that just want a transaction.
 func beginTx(t *testing.T, env *testEnv) *transaction.Transaction {
 	t.Helper()
 	tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
@@ -124,8 +120,6 @@ func intSchema(t *testing.T) *catalog.Schema {
 	return schema
 }
 
-// insertInt inserts one integer and returns its RID. Registers a cleanup that
-// aborts the tx if the test forgets to commit.
 func insertInt(
 	t *testing.T,
 	env *testEnv,
@@ -178,9 +172,6 @@ func TestTableHeap_InsertAndGet(t *testing.T) {
 	}
 }
 
-// TestTableHeap_ReadOwnUncommittedWrite proves that a transaction sees its
-// own writes even before committing — the "my own writes are visible to me"
-// branch of the visibility predicate.
 func TestTableHeap_ReadOwnUncommittedWrite(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -190,7 +181,6 @@ func TestTableHeap_ReadOwnUncommittedWrite(t *testing.T) {
 
 	rid := insertInt(t, env, tx, schema, 1234)
 
-	// Same tx, fresh statement: the row must be visible.
 	tx.NextCommandID()
 	got, err := env.heap.GetTuple(tx, rid, schema)
 	if err != nil {
@@ -202,11 +192,102 @@ func TestTableHeap_ReadOwnUncommittedWrite(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// Aborted-transaction visibility
+// -----------------------------------------------------------------------------
+
+// TestAbortedInsertIsInvisible: a row inserted by an aborted transaction must
+// be invisible to all subsequent transactions.
+func TestAbortedInsertIsInvisible(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	// Tx1 inserts and aborts.
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx1.NextCommandID()
+	rid, err := env.heap.InsertTuple(tx1,
+		NewTuple([]types.Value{types.NewInteger(1)}), schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.tm.Abort(tx1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx2 (after tx1 aborted) must NOT see the row.
+	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	defer env.tm.Commit(tx2)
+
+	if _, err := env.heap.GetTuple(tx2, rid, schema); err == nil {
+		t.Fatal("aborted insert is visible — visibility predicate is buggy")
+	}
+
+	// Iterator must also skip it.
+	it := env.heap.Iterator(tx2, schema)
+	it.Init()
+	count := 0
+	for {
+		_, err, done := it.Next()
+		if done {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		count++
+	}
+	if count != 0 {
+		t.Fatalf("iterator returned %d rows for aborted insert, want 0", count)
+	}
+}
+
+// TestAbortedDeleteIsVisible: a row deleted by an aborted transaction must
+// remain visible.
+func TestAbortedDeleteIsVisible(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	// Pre-existing row.
+	tx0, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx0.NextCommandID()
+	rid, _ := env.heap.InsertTuple(tx0,
+		NewTuple([]types.Value{types.NewInteger(42)}), schema)
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx1 deletes and aborts.
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx1.NextCommandID()
+	if err := env.heap.MarkTupleAsDeleted(tx1, rid); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.tm.Abort(tx1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx2 must still see the row.
+	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	defer env.tm.Commit(tx2)
+
+	got, err := env.heap.GetTuple(tx2, rid, schema)
+	if err != nil {
+		t.Fatalf("row deleted by aborted tx is invisible: %v", err)
+	}
+	if v, ok := got.Values[0].(types.Fixed4ByteValue); !ok || int32(v.Value) != 42 {
+		t.Errorf("value = %v, want 42", got.Values[0])
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Snapshot isolation
 // -----------------------------------------------------------------------------
 
-// TestTableHeap_SnapshotIsolation_Insert: a row inserted and committed after
-// another tx's snapshot was taken must be invisible to that snapshot.
 func TestTableHeap_SnapshotIsolation_Insert(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -214,13 +295,11 @@ func TestTableHeap_SnapshotIsolation_Insert(t *testing.T) {
 	schema := intSchema(t)
 	ctx := context.Background()
 
-	// Tx1 begins first — its snapshot predates everything.
 	tx1, err := env.tm.Begin(ctx, transaction.BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Tx2 inserts and commits a row.
 	tx2, err := env.tm.Begin(ctx, transaction.BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -234,12 +313,10 @@ func TestTableHeap_SnapshotIsolation_Insert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Tx1 must not see the row: it was inserted after tx1's snapshot.
 	if _, err := env.heap.GetTuple(tx1, rid, schema); err == nil {
 		t.Fatalf("tx1 saw a row inserted after its snapshot")
 	}
 
-	// Tx3 begins after tx2 committed; it must see the row.
 	tx3, err := env.tm.Begin(ctx, transaction.BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -252,8 +329,6 @@ func TestTableHeap_SnapshotIsolation_Insert(t *testing.T) {
 	_ = env.tm.Commit(tx3)
 }
 
-// TestTableHeap_SnapshotIsolation_Delete: a row deleted after a snapshot was
-// taken must still be visible to that snapshot.
 func TestTableHeap_SnapshotIsolation_Delete(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -261,21 +336,17 @@ func TestTableHeap_SnapshotIsolation_Delete(t *testing.T) {
 	schema := intSchema(t)
 	ctx := context.Background()
 
-	// Pre-existing row committed by an initial tx.
 	tx0 := beginTx(t, env)
 	rid := insertInt(t, env, tx0, schema, 555)
 	if err := env.tm.Commit(tx0); err != nil {
 		t.Fatal(err)
 	}
 
-	// Tx1 begins and snapshots. It must keep seeing the row even after tx2
-	// deletes it.
 	tx1, err := env.tm.Begin(ctx, transaction.BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Tx2 deletes and commits.
 	tx2, err := env.tm.Begin(ctx, transaction.BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -288,12 +359,10 @@ func TestTableHeap_SnapshotIsolation_Delete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Tx1 still sees the row.
 	if _, err := env.heap.GetTuple(tx1, rid, schema); err != nil {
 		t.Fatalf("tx1 lost visibility of a row deleted after its snapshot: %v", err)
 	}
 
-	// A new tx does not.
 	tx3, err := env.tm.Begin(ctx, transaction.BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -307,12 +376,9 @@ func TestTableHeap_SnapshotIsolation_Delete(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Write-write conflict (optimistic mode)
+// Write-write conflict (optimistic)
 // -----------------------------------------------------------------------------
 
-// TestTableHeap_OptimisticConflict: two overlapping optimistic transactions
-// updating the same row — exactly one should abort with a serialization
-// failure.
 func TestTableHeap_OptimisticConflict(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -326,18 +392,14 @@ func TestTableHeap_OptimisticConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Two transactions both want to update the row optimistically.
-	txA, _ := env.tm.Begin(ctx, transaction.BeginOptions{Mode: transaction.Optimistic})
-	txB, _ := env.tm.Begin(ctx, transaction.BeginOptions{Mode: transaction.Optimistic})
+	txA, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	txB, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 
-	// Both mark the tuple's xmax.
 	txA.NextCommandID()
 	if err := env.heap.MarkTupleAsDeleted(txA, rid); err != nil {
 		t.Fatalf("txA MarkTupleAsDeleted: %v", err)
 	}
-	// txA's xmax is now on the tuple, and txA is in-flight.
 
-	// txB should detect the conflict before touching the row.
 	txB.NextCommandID()
 	err := env.heap.checkUpdateConflict(txB, rid)
 	if err != transaction.ErrSerializationFailure {
@@ -352,9 +414,6 @@ func TestTableHeap_OptimisticConflict(t *testing.T) {
 // Concurrent inserts
 // -----------------------------------------------------------------------------
 
-// TestTableHeap_ConcurrentInsertsUniqueAndReadable: N goroutines each with
-// their own transaction insert rows. Every row must be unique, readable, and
-// non-null after all transactions commit.
 func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
 	env := setupEnv(t, 4, 16)
 	defer env.Shutdown(t)
@@ -422,7 +481,6 @@ func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
 		t.Fatalf("inserted %d tuples, want %d", len(rids), want)
 	}
 
-	// Every inserted row must be visible from a fresh transaction.
 	readTx := beginTx(t, env)
 	for _, rid := range rids {
 		got, err := env.heap.GetTuple(readTx, rid, schema)
@@ -435,10 +493,6 @@ func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
 	}
 	_ = env.tm.Commit(readTx)
 }
-
-// -----------------------------------------------------------------------------
-// Stale FSM retry
-// -----------------------------------------------------------------------------
 
 func TestTableHeap_ConcurrentInsertsForceStaleFSMRetry(t *testing.T) {
 	env := setupEnv(t, 2, 16)
@@ -543,7 +597,6 @@ func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
 		go func() {
 			defer readerWG.Done()
 
-			// Each reader has its own long-running snapshot.
 			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
 			if err != nil {
 				failCnt.Add(1)
@@ -562,9 +615,6 @@ func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
 				if n == 0 {
 					continue
 				}
-				// The row may or may not be visible to this snapshot;
-				// either outcome is fine, but a hard error (I/O, deserialization)
-				// is not.
 				_, err := env.heap.GetTuple(tx, rid, schema)
 				if err != nil && err != ErrTupleNotFound {
 					t.Errorf("GetTuple(%v): %v", rid, err)
@@ -595,7 +645,6 @@ func TestTableHeap_ConcurrentDeletesOfDistinctTuples(t *testing.T) {
 	schema := intSchema(t)
 	const n = 200
 
-	// Insert N rows in one tx and commit.
 	tx0 := beginTx(t, env)
 	rids := make([]common.RecordId, n)
 	for i := 0; i < n; i++ {
@@ -605,7 +654,6 @@ func TestTableHeap_ConcurrentDeletesOfDistinctTuples(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Each delete uses its own transaction.
 	var wg sync.WaitGroup
 	var failCnt atomic.Int32
 
@@ -637,8 +685,6 @@ func TestTableHeap_ConcurrentDeletesOfDistinctTuples(t *testing.T) {
 	}
 }
 
-// TestTableHeap_ConcurrentDeleteSameTupleOneWinner: only one of the concurrent
-// deletes can succeed — the rest see the tuple already has a non-zero xmax.
 func TestTableHeap_ConcurrentDeleteSameTupleOneWinner(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -698,7 +744,6 @@ func TestTableHeap_Iterator(t *testing.T) {
 
 	schema := intSchema(t)
 
-	// Insert 10 rows in one committed tx.
 	tx0 := beginTx(t, env)
 	for i := 0; i < 10; i++ {
 		_ = insertInt(t, env, tx0, schema, int32(i))
@@ -707,7 +752,6 @@ func TestTableHeap_Iterator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A fresh tx iterates and sees exactly the committed rows.
 	readTx := beginTx(t, env)
 	defer env.tm.Commit(readTx)
 
@@ -740,8 +784,6 @@ func TestTableHeap_Iterator(t *testing.T) {
 	}
 }
 
-// TestTableHeap_IteratorSkipsUncommitted: an uncommitted insert from another
-// transaction must be invisible to an iterator with an earlier snapshot.
 func TestTableHeap_IteratorSkipsUncommitted(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -749,7 +791,6 @@ func TestTableHeap_IteratorSkipsUncommitted(t *testing.T) {
 	schema := intSchema(t)
 	ctx := context.Background()
 
-	// Tx1 commits 5 rows.
 	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 	for i := 0; i < 5; i++ {
 		tx1.NextCommandID()
@@ -762,7 +803,6 @@ func TestTableHeap_IteratorSkipsUncommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Tx2 inserts more rows but does NOT commit.
 	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 	for i := 5; i < 10; i++ {
 		tx2.NextCommandID()
@@ -771,9 +811,7 @@ func TestTableHeap_IteratorSkipsUncommitted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// intentionally not committed
 
-	// A third transaction sees only tx1's 5 committed rows.
 	tx3, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 	it := env.heap.Iterator(tx3, schema)
 	it.Init()
@@ -798,80 +836,9 @@ func TestTableHeap_IteratorSkipsUncommitted(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Pessimistic mode
+// Undo chain behaviour
 // -----------------------------------------------------------------------------
 
-// TestTableHeap_PessimisticUpdateBlocks: two pessimistic transactions
-// targeting the same row — the second must block until the first releases.
-func TestTableHeap_PessimisticUpdateBlocks(t *testing.T) {
-	env := setupEnv(t, 2, 8)
-	defer env.Shutdown(t)
-
-	schema := intSchema(t)
-	ctx := context.Background()
-
-	// Row for both txs to fight over.
-	tx0 := beginTx(t, env)
-	rid := insertInt(t, env, tx0, schema, 1)
-	if err := env.tm.Commit(tx0); err != nil {
-		t.Fatal(err)
-	}
-
-	// Tx A takes the row lock (via SelectForUpdate).
-	txA, _ := env.tm.Begin(ctx, transaction.BeginOptions{Mode: transaction.Pessimistic})
-	if _, err := env.heap.SelectForUpdate(txA, rid, schema); err != nil {
-		t.Fatalf("txA SelectForUpdate: %v", err)
-	}
-
-	// Tx B tries the same lock — it should block. Use a short timeout in
-	// the lock manager to keep the test fast.
-	done := make(chan error, 1)
-	go func() {
-		txB, _ := env.tm.Begin(ctx, transaction.BeginOptions{Mode: transaction.Pessimistic})
-		_, err := env.heap.SelectForUpdate(txB, rid, schema)
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		t.Fatalf("txB should have blocked, got err=%v", err)
-	case <-timeAfter(100):
-		// Still blocked; expected.
-	}
-
-	// Release A.
-	if err := env.tm.Commit(txA); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("txB after release: %v", err)
-		}
-	case <-timeAfter(2_000):
-		t.Fatal("txB did not wake after txA released")
-	}
-}
-
-// timeAfter is a tiny helper to keep the imports clean.
-func timeAfter(ms int) <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		sleepMillis(ms)
-		close(ch)
-	}()
-	return ch
-}
-
-// sleepMillis wraps time.Sleep for readability.
-func sleepMillis(ms int) {
-	time.Sleep(time.Duration(ms) * time.Millisecond)
-}
-
-// TestTableHeap_LosingDeleteHasEmptyUndoChain verifies that a transaction
-// which fails to delete a tuple does not leave a WAL record describing the
-// failed change. This is what makes Abort on a loser safe without an applier.
 func TestTableHeap_LosingDeleteHasEmptyUndoChain(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -879,51 +846,48 @@ func TestTableHeap_LosingDeleteHasEmptyUndoChain(t *testing.T) {
 	schema := intSchema(t)
 	ctx := context.Background()
 
-	// Insert and commit a row.
 	tx0 := beginTx(t, env)
 	rid := insertInt(t, env, tx0, schema, 1)
 	if err := env.tm.Commit(tx0); err != nil {
 		t.Fatal(err)
 	}
 
-	// Tx1 deletes the row successfully.
+	// Tx1 deletes the row successfully; it remains in-flight.
 	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 	tx1.NextCommandID()
 	if err := env.heap.MarkTupleAsDeleted(tx1, rid); err != nil {
 		t.Fatalf("tx1 delete: %v", err)
 	}
 
-	// Tx2 attempts the same delete. It should fail at the pre-check before
-	// logging anything.
+	// Tx2 attempts the same delete. It must fail at the pre-check before
+	// logging a WAL record — either ErrSerializationFailure (in-flight
+	// holder) or a generic already-deleted error (committed holder).
 	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 	tx2.NextCommandID()
-	if err := env.heap.MarkTupleAsDeleted(tx2, rid); err == nil {
+	err := env.heap.MarkTupleAsDeleted(tx2, rid)
+	if err == nil {
 		t.Fatal("tx2 should have failed to delete an already-deleted tuple")
 	}
-
-	// tx2's undo chain must be empty (only the Begin record).
-	// We can't read FirstLSN directly from the test, but we can abort
-	// tx2 without an applier and verify it does not panic.
-	if err := env.tm.Abort(tx2, nil); err != nil {
-		t.Fatalf("Abort(tx2, nil) after failed delete: %v", err)
+	if err != transaction.ErrSerializationFailure {
+		t.Fatalf("expected ErrSerializationFailure (tx1 in-flight), got %v", err)
 	}
 
-	// tx1 is still active and holding its delete. Commit it.
+	// tx2's undo chain is empty; aborting without an applier must succeed.
+	if err := env.tm.Abort(tx2, nil); err != nil {
+		t.Fatalf("Abort(tx2, nil): %v", err)
+	}
+
 	if err := env.tm.Commit(tx1); err != nil {
 		t.Fatalf("tx1 commit: %v", err)
 	}
 }
 
-// TestTableHeap_AbortWithNilApplierIsSafe verifies that a transaction with
-// no before-image records can be aborted with a nil applier.
 func TestTableHeap_AbortWithNilApplierIsSafe(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
 
 	schema := intSchema(t)
 
-	// A transaction that only inserts: the RecInsert has FlagHasAfter but
-	// not FlagHasBefore, so the undo walk has nothing to apply.
 	tx := beginTx(t, env)
 	insertInt(t, env, tx, schema, 100)
 	insertInt(t, env, tx, schema, 200)
@@ -938,8 +902,8 @@ func TestTableHeap_AbortWithNilApplierIsSafe(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // TestTableHeap_InsertLogsWALRecord verifies that inserting a tuple produces
-// a RecInsert WAL record with the correct payload, txid, prevLSN, and flags,
-// and that the page's LSN is set to that record's LSN.
+// a RecInsert WAL record carrying the full tuple blob (header + null bitmap +
+// user data + padding), with matching txid, prevLSN, flags, and page LSN.
 func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -954,17 +918,16 @@ func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
 		t.Fatalf("InsertTuple: %v", err)
 	}
 
-	// Flush the WAL so the record is visible to ReadAt.
 	if err := env.wal.FlushUpTo(tx.LastLSN); err != nil {
 		t.Fatalf("FlushUpTo: %v", err)
 	}
 
-	// --- Verify the insert record ---
 	rec, err := env.wal.ReadAt(tx.LastLSN)
 	if err != nil {
 		t.Fatalf("ReadAt(%v): %v", tx.LastLSN, err)
 	}
 
+	// --- Record metadata ---
 	if rec.Type != wal.RecInsert {
 		t.Errorf("Type: got %v want RecInsert", rec.Type)
 	}
@@ -981,7 +944,7 @@ func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
 		t.Errorf("PrevLSN: got %v want %v (Begin record)", rec.PrevLSN, tx.FirstLSN)
 	}
 
-	// --- Verify the payload names the same row that InsertTuple returned ---
+	// --- Payload identity ---
 	row, payload, err := wal.DecodeInsert(rec.Data)
 	if err != nil {
 		t.Fatalf("DecodeInsert: %v", err)
@@ -995,14 +958,40 @@ func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
 		t.Errorf("RowId in payload: got %+v want %+v", row, wantRow)
 	}
 
-	// --- Verify the payload contains the tuple bytes we serialized ---
+	// --- Payload is a full tuple blob ---
 	data, nulls := tuple.Serialize(schema)
-	want := append(append([]byte(nil), data...), nulls...)
-	if !bytes.Equal(payload, want) {
-		t.Errorf("payload bytes mismatch:\n got: %x\nwant: %x", payload, want)
+	hoff, tupleSize, _ := heap.CalculateBytesNeededToInsertTuple(len(data), len(nulls))
+	if len(payload) != tupleSize {
+		t.Fatalf("payload size: got %d want %d", len(payload), tupleSize)
 	}
 
-	// --- Verify the page's LSN was set to the insert record's LSN ---
+	gotXmin := common.TransactionID(common.ByteOrder.Uint32(
+		payload[heap.TupleHeaderOffsetXmin:]))
+	if gotXmin != tx.Id {
+		t.Errorf("payload xmin: got %d want %d", gotXmin, tx.Id)
+	}
+	gotXmax := common.TransactionID(common.ByteOrder.Uint32(
+		payload[heap.TupleHeaderOffsetXmax:]))
+	if gotXmax != 0 {
+		t.Errorf("payload xmax: got %d want 0", gotXmax)
+	}
+	gotCtidBlock := common.BlockID(common.ByteOrder.Uint32(
+		payload[heap.TupleHeaderOffsetCtid:]))
+	gotCtidSlot := common.SlotIndex(common.ByteOrder.Uint16(
+		payload[heap.TupleHeaderOffsetCtid+4:]))
+	if gotCtidBlock != rid.BlockID || gotCtidSlot != rid.Slot {
+		t.Errorf("payload ctid: got (%d,%d) want (%d,%d)",
+			gotCtidBlock, gotCtidSlot, rid.BlockID, rid.Slot)
+	}
+	gotHoff := int(payload[heap.TupleHeaderOffsetHoff])
+	if gotHoff != hoff {
+		t.Errorf("payload hoff: got %d want %d", gotHoff, hoff)
+	}
+	if !bytes.Equal(payload[hoff:hoff+len(data)], data) {
+		t.Errorf("payload user data mismatch")
+	}
+
+	// --- Page LSN matches the record's LSN ---
 	tag := buffer.BufferTag{
 		RelationID: env.heap.rel,
 		ForkID:     env.heap.fork,
@@ -1022,7 +1011,7 @@ func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
 		t.Errorf("page LSN: got %v want %v", pageLSN, rec.LSN)
 	}
 
-	// --- Verify the Begin record is where the insert's PrevLSN points ---
+	// --- Begin record sanity ---
 	beginRec, err := env.wal.ReadAt(tx.FirstLSN)
 	if err != nil {
 		t.Fatalf("ReadAt(Begin LSN): %v", err)
@@ -1036,8 +1025,8 @@ func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
 }
 
 // TestTableHeap_DeleteLogsWALRecord verifies that deleting a tuple produces
-// a RecDelete WAL record carrying the before-image, and that the record's
-// PrevLSN points back to the previous record in the same transaction.
+// a RecDelete WAL record carrying the full before-image (pre-delete tuple
+// bytes, header included), with matching txid, prevLSN, and flags.
 func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -1048,7 +1037,8 @@ func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 	// Insert and commit a row so it exists for the delete.
 	tx0, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
 	tx0.NextCommandID()
-	rid, err := env.heap.InsertTuple(tx0, NewTuple([]types.Value{types.NewInteger(7)}), schema)
+	rid, err := env.heap.InsertTuple(tx0,
+		NewTuple([]types.Value{types.NewInteger(7)}), schema)
 	if err != nil {
 		t.Fatalf("InsertTuple: %v", err)
 	}
@@ -1056,7 +1046,7 @@ func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Capture the tuple bytes as they exist on disk (before-image source).
+	// Capture the on-page tuple bytes as the expected before-image.
 	tag := buffer.BufferTag{
 		RelationID: env.heap.rel,
 		ForkID:     env.heap.fork,
@@ -1080,7 +1070,6 @@ func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 		t.Fatalf("MarkTupleAsDeleted: %v", err)
 	}
 
-	// Flush and read the delete record.
 	if err := env.wal.FlushUpTo(tx1.LastLSN); err != nil {
 		t.Fatal(err)
 	}
@@ -1106,7 +1095,6 @@ func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 		t.Errorf("PrevLSN: got %v want %v (Begin record)", rec.PrevLSN, firstLSN)
 	}
 
-	// Payload names the row and contains the before-image.
 	row, before, err := wal.DecodeDelete(rec.Data)
 	if err != nil {
 		t.Fatalf("DecodeDelete: %v", err)
@@ -1124,4 +1112,93 @@ func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 	}
 
 	_ = env.tm.Commit(tx1)
+}
+
+// TestTableHeap_InsertSetsRecLSN verifies that the WAL LSN assigned to an
+// insert propagates to the buffer pool frame's recLSN. This is what makes
+// the checkpoint's dirty page table useful: it points recovery at the
+// earliest WAL record that dirtied the page.
+func TestTableHeap_InsertSetsRecLSN(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	rid := insertInt(t, env, tx, schema, 42)
+
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    rid.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	// recLSN must equal the insert record's LSN (tx.LastLSN).
+	if got := frame.RecLSN(); got != tx.LastLSN {
+		t.Errorf("recLSN = %v, want %v (insert's WAL LSN)", got, tx.LastLSN)
+	}
+}
+
+// TestTableHeap_SecondInsertKeepsFirstRecLSN verifies that a second insert
+// on the same page does not lower the recorded recLSN — the DPT must point
+// at the earliest record that dirtied the page, not the latest.
+func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
+	env := setupEnv(t, 1, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	first := insertInt(t, env, tx, schema, 1)
+	firstLSN := tx.LastLSN
+
+	// Second insert lands on the same page (single partition, one frame,
+	// plenty of room).
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    first.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame.RLatch()
+	free := heapFreeSpace(frame.Page)
+	frame.RUnlatch()
+	frame.Unpin()
+
+	if free < 100 {
+		t.Skipf("first page too full to guarantee same-page insert: %d bytes free", free)
+	}
+
+	second := insertInt(t, env, tx, schema, 2)
+	if second.BlockID != first.BlockID {
+		t.Skipf("second insert went to a different page (%d vs %d)",
+			second.BlockID, first.BlockID)
+	}
+
+	frame, err, _ = env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	if got := frame.RecLSN(); got != firstLSN {
+		t.Errorf("recLSN after 2 inserts = %v, want %v (first insert's LSN)",
+			got, firstLSN)
+	}
+}
+
+// heapFreeSpace is a tiny helper to peek at free space without holding the
+// page latch past the return. Defined locally so the test doesn't need a
+// package-level export.
+func heapFreeSpace(p page.Page) int {
+	hp := &heap.HeapPage{Page: p}
+	return hp.GetFreeSpace()
 }

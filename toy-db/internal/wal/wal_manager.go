@@ -783,3 +783,97 @@ func (w *WAL) Close() error {
 	}
 	return w.fatal()
 }
+
+// TruncateBefore removes every WAL segment that is entirely below lsn.
+//
+// A segment is "entirely below" when its segment number is strictly less
+// than lsn.SegNo(). The segment containing lsn itself is always retained,
+// because it may still hold records at or above lsn.
+//
+// The currently-active segment is never removed, even if its number happens
+// to be below lsn.SegNo(). This would only happen through a caller bug
+// (truncating past the write position), but the WAL refuses to delete data
+// it is still writing to.
+//
+// Truncation is safe only when the caller has established that no reader
+// (recovery, replication, CDC) will request an LSN from the removed
+// segments. In practice this means: a checkpoint at or after lsn is durable,
+// every page described by that checkpoint has been flushed, and no
+// replication stream is lagging behind lsn.
+//
+// Returns nil for lsn == 0 (no-op) and for an empty WAL.
+func (w *WAL) TruncateBefore(lsn LSN) error {
+	if lsn.IsZero() {
+		return nil
+	}
+	if w.closed.Load() {
+		return ErrClosed
+	}
+
+	// Snapshot currentSeg under mu, then release. Deletion of old segments
+	// does not race with concurrent appends or rotations, and holding mu
+	// during the syscalls would stall the write path.
+	w.mu.Lock()
+	currentSeg := w.currentSeg
+	w.mu.Unlock()
+
+	targetSeg := lsn.GetSegmentNumber()
+
+	// Truncating "before" a segment we haven't reached yet is a caller bug.
+	// It means the caller thinks the WAL is further along than it is.
+	if targetSeg > currentSeg {
+		return fmt.Errorf(
+			"%w: truncate target seg %d is beyond current seg %d",
+			ErrBadLSN, targetSeg, currentSeg)
+	}
+
+	segs, err := listAllSegments(w.opts.Dir)
+	if err != nil {
+		return fmt.Errorf("wal truncate: list segments: %w", err)
+	}
+
+	removed := 0
+	for _, segNo := range segs {
+		// Segments are sorted ascending. Once we hit targetSeg (or a
+		// higher one), there's nothing left to remove.
+		if segNo >= targetSeg {
+			break
+		}
+		// Defensive: never remove the active segment.
+		if segNo == currentSeg {
+			continue
+		}
+
+		path := filepath.Join(w.opts.Dir, segmentName(segNo))
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Another caller (or a previous failed truncate) already
+				// removed it. Harmless.
+				continue
+			}
+			return fmt.Errorf("wal truncate: remove %s: %w", path, err)
+		}
+		removed++
+	}
+
+	if removed == 0 {
+		return nil
+	}
+
+	// Fsync the directory so removals survive a crash. If this fails the
+	// data is still consistent — a crash would resurrect the segments,
+	// which is safe but wasteful. Return the error so callers can decide.
+	dir, err := os.Open(w.opts.Dir)
+	if err != nil {
+		return fmt.Errorf("wal truncate: open dir: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("wal truncate: fsync dir: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("wal truncate: close dir: %w", closeErr)
+	}
+	return nil
+}

@@ -19,16 +19,22 @@ import (
 var ErrTupleNotFound = errors.New("tuple not found")
 
 // TableHeap is the physical layer for a heap-organized relation. It provides
-// MVCC-aware CRUD on tuples: every read filters by the transaction's snapshot,
-// every write goes through the WAL before touching memory, and every write
-// path is mode-aware (optimistic vs. pessimistic).
+// MVCC-aware CRUD on tuples: every read filters by the transaction's snapshot
+// and the transaction manager's historical state (committed/aborted), every
+// write goes through the WAL before touching memory, and every write is
+// optimistic (conflict detection via the tuple's xmax).
+//
+// Pessimistic mode (blocking on row locks) is deferred until the xmax-as-lock
+// refactor lands. SELECT FOR UPDATE / SHARE currently do not block on other
+// writers; they read the current version under the assumption that no other
+// transaction is mid-write on the same row.
 type TableHeap struct {
 	bp       *buffer.BufferPool
 	fsm      *FSM
 	rel      common.RelationID
 	fork     common.ForkID
-	tm       *transaction.TransactionManager // for IsInProgress
-	extendMu sync.Mutex                      // serializes extending the relation
+	tm       *transaction.TransactionManager
+	extendMu sync.Mutex
 }
 
 func NewTableHeap(
@@ -51,8 +57,7 @@ func NewTableHeap(
 // -----------------------------------------------------------------------------
 
 // getPageForInsert finds a page with room for requiredSpace bytes, or extends
-// the relation if no existing page has room. Returns the frame pinned and
-// write-latched on the caller's behalf.
+// the relation if no existing page has room. Returns the frame pinned.
 func (th *TableHeap) getPageForInsert(
 	requiredSpace int,
 ) (common.BlockID, *buffer.Frame, error) {
@@ -128,6 +133,10 @@ func (th *TableHeap) getPageForInsert(
 
 // InsertTuple serializes tuple and inserts it into the first available page
 // with room. Logs a RecInsert record to the WAL before mutating the page.
+//
+// The WAL record carries the full on-page tuple blob (header + null bitmap +
+// user data + padding), so recovery's redo pass can install the bytes
+// verbatim without reconstructing the header.
 func (th *TableHeap) InsertTuple(
 	t *transaction.Transaction,
 	tuple *Tuple,
@@ -163,15 +172,19 @@ func (th *TableHeap) InsertTuple(
 		}
 		row := common.RowId{RelationID: th.rel, BlockID: targetBlockID, Slot: slot}
 
-		// 2. WAL first — write-ahead rule.
-		payload := make([]byte, 0, len(data)+len(nullBitmap))
-		payload = append(payload, data...)
-		payload = append(payload, nullBitmap...)
+		// 2. Build the exact bytes. Pure — no page mutation.
+		tupleBytes := heapPage.BuildTupleBytes(
+			data, nullBitmap,
+			targetBlockID, slot,
+			t.Id, 0, t.NextCommandID(),
+		)
 
+		// 3. WAL first — write-ahead rule. Payload carries the full tuple
+		// blob, header included.
 		lsn, err := t.Log(&wal.Record{
 			Type:  wal.RecInsert,
 			Flags: wal.FlagHasAfter,
-			Data:  wal.EncodeInsert(row, payload),
+			Data:  wal.EncodeInsert(row, tupleBytes),
 		})
 		if err != nil {
 			frame.WUnlatch()
@@ -179,21 +192,21 @@ func (th *TableHeap) InsertTuple(
 			return common.RecordId{}, fmt.Errorf("wal insert: %w", err)
 		}
 
-		// 3. Apply in memory.
-		rId, err := heapPage.InsertTuple(data, nullBitmap, targetBlockID, t.Id, t.NextCommandID())
+		// 4. Install — the actual page mutation.
+		rId, err := heapPage.InstallTuple(slot, tupleBytes)
 		if err != nil {
 			frame.WUnlatch()
 			frame.Unpin()
-			return common.RecordId{}, fmt.Errorf("insert tuple: %w", err)
+			return common.RecordId{}, fmt.Errorf("install tuple: %w", err)
 		}
 
-		// 4. Record the WAL position on the page so the buffer pool can
+		// 5. Record the WAL position on the page so the buffer pool can
 		// enforce the write-ahead rule when flushing.
 		frame.Page.SetLSN(lsn)
 
 		remainingSpace := heapPage.GetFreeSpace()
 		frame.WUnlatch()
-		frame.SetDirty()
+		th.bp.MarkDirtyWithLSN(frame, lsn)
 		frame.Unpin()
 
 		_ = th.fsm.RecordFreeSpace(th.rel, targetBlockID, remainingSpace)
@@ -256,8 +269,7 @@ func (th *TableHeap) snapshotVersion(
 }
 
 // currentVersion reads the latest committed version at rId, ignoring the
-// snapshot. Used by SELECT FOR UPDATE / SHARE and by the pessimistic write
-// path.
+// snapshot. Used by SELECT FOR UPDATE / SHARE.
 func (th *TableHeap) currentVersion(
 	rId common.RecordId,
 	schema *catalog.Schema,
@@ -278,9 +290,14 @@ func (th *TableHeap) currentVersion(
 	if err != nil {
 		return nil, err
 	}
-	// Committed-dead → row gone from the current state.
+
+	// If XMax is set by a completed transaction, check whether that
+	// transaction committed (row gone) or aborted (delete didn't take).
 	if header.XMax != 0 && !th.tm.IsInProgress(header.XMax) {
-		return nil, ErrTupleNotFound
+		xmaxCommitted, cerr := th.tm.IsCommitted(header.XMax)
+		if cerr == nil && xmaxCommitted {
+			return nil, ErrTupleNotFound
+		}
 	}
 
 	raw := heapPage.GetTupleWithSlot(rId.Slot)
@@ -290,19 +307,61 @@ func (th *TableHeap) currentVersion(
 	return DeserializeTuple(buf, schema)
 }
 
-// visibleTo applies the MVCC visibility rule, including the "my own writes
-// are visible to me" cases.
+// visibleTo applies the MVCC visibility rule, consulting both the snapshot
+// (for "was this transaction running when I started?") and the transaction
+// manager's historical state (for "did this transaction commit or abort?").
+//
+// The rule, in order:
+//
+//  1. My own uncommitted writes are visible to me (unless I deleted them).
+//  2. I deleted this version — invisible to me.
+//  3. The creator must have committed before my snapshot:
+//     a. Began after my snapshot (XMin >= Snapshot.XMax)     -> invisible.
+//     b. Was running when my snapshot was taken              -> invisible.
+//     c. Finished before my snapshot: committed -> visible, aborted -> invisible.
+//  4. If deleted (XMax != 0):
+//     a. Began after my snapshot (XMax >= Snapshot.XMax)     -> visible.
+//     b. Was running when my snapshot was taken              -> visible.
+//     c. Finished before my snapshot: committed -> invisible, aborted -> visible.
+//
+// Errors from IsCommitted are fail-closed on the creator (hide the row) and
+// fail-open on the deleter (keep the row visible).
 func (th *TableHeap) visibleTo(t *transaction.Transaction, h heap.TupleHeader) bool {
+	// --- own writes ---
 	if h.XMin == t.Id {
-		if h.XMax == t.Id {
-			return false // I inserted then deleted it
-		}
-		return true // I created this version
+		return h.XMax != t.Id
 	}
 	if h.XMax == t.Id {
-		return false // I deleted it
+		return false
 	}
-	return t.Snapshot.IsVisible(h.XMin, h.XMax)
+
+	// --- creator check ---
+	if h.XMin >= t.Snapshot.XMax {
+		return false
+	}
+	if t.Snapshot.InProgressContains(h.XMin) {
+		return false
+	}
+	xminCommitted, err := th.tm.IsCommitted(h.XMin)
+	if err != nil || !xminCommitted {
+		return false
+	}
+
+	// --- deleter check ---
+	if h.XMax == 0 {
+		return true
+	}
+	if h.XMax >= t.Snapshot.XMax {
+		return true
+	}
+	if t.Snapshot.InProgressContains(h.XMax) {
+		return true
+	}
+	xmaxCommitted, err := th.tm.IsCommitted(h.XMax)
+	if err != nil {
+		return true // fail-open on delete
+	}
+	return !xmaxCommitted
 }
 
 // -----------------------------------------------------------------------------
@@ -312,6 +371,9 @@ func (th *TableHeap) visibleTo(t *transaction.Transaction, h heap.TupleHeader) b
 // MarkTupleAsDeleted stamps xmax on the tuple at rId, marking it logically
 // deleted by t. The physical bytes remain until vacuum reclaims them, so older
 // snapshots can still see the version.
+//
+// The WAL record carries the full pre-delete tuple bytes as the before-image
+// so undo can restore them.
 func (th *TableHeap) MarkTupleAsDeleted(
 	t *transaction.Transaction,
 	rId common.RecordId,
@@ -331,7 +393,16 @@ func (th *TableHeap) MarkTupleAsDeleted(
 		return ErrTupleNotFound
 	}
 
+	// Pre-check: fail before logging so a losing transaction's undo chain
+	// stays empty. Distinguish "held by in-flight tx" (retryable) from
+	// "genuinely gone" (permanent).
 	if err := heapPage.CanDeleteTuple(rId.Slot); err != nil {
+		header, herr := heapPage.GetTupleHeader(rId.Slot)
+		if herr == nil && header.XMax != 0 && th.tm.IsInProgress(header.XMax) {
+			frame.WUnlatch()
+			frame.Unpin()
+			return transaction.ErrSerializationFailure
+		}
 		frame.WUnlatch()
 		frame.Unpin()
 		return err
@@ -367,7 +438,7 @@ func (th *TableHeap) MarkTupleAsDeleted(
 	frame.Page.SetLSN(lsn)
 
 	frame.WUnlatch()
-	frame.SetDirty()
+	th.bp.MarkDirtyWithLSN(frame, lsn)
 	frame.Unpin()
 	return nil
 }
@@ -378,37 +449,21 @@ func (th *TableHeap) MarkTupleAsDeleted(
 
 // UpdateTuple replaces the row at rId with newTuple.
 //
-// Optimistic mode: checks the target tuple's xmax for a concurrent writer.
-// Returns ErrSerializationFailure on conflict; caller retries.
+// Every update takes the optimistic path: check the target tuple's xmax for
+// a concurrent writer, abort with ErrSerializationFailure on conflict, else
+// delete the old version and insert the new one.
 //
-// Pessimistic mode: takes an exclusive row lock first, held to commit. Blocks
-// if another transaction holds it.
+// Pessimistic mode (blocking on row locks) will return after the xmax-as-lock
+// refactor; until then SELECT FOR UPDATE / SHARE do not block writers.
 func (th *TableHeap) UpdateTuple(
 	t *transaction.Transaction,
 	rId common.RecordId,
 	newTuple *Tuple,
 	schema *catalog.Schema,
 ) (common.RecordId, error) {
-	row := common.RowId{RelationID: th.rel, BlockID: rId.BlockID, Slot: rId.Slot}
-
-	switch t.Mode {
-	case transaction.Optimistic:
-		if err := th.checkUpdateConflict(t, rId); err != nil {
-			return common.RecordId{}, err
-		}
-	case transaction.Pessimistic:
-		if err := t.LockRow(row, lock.LockExclusive); err != nil {
-			return common.RecordId{}, fmt.Errorf("lock row: %w", err)
-		}
-		// Under the lock, verify the row still exists in the current state.
-		if err := th.checkCurrentVersionExists(rId); err != nil {
-			return common.RecordId{}, err
-		}
-	default:
-		return common.RecordId{}, fmt.Errorf("unknown tx mode %v", t.Mode)
+	if err := th.checkUpdateConflict(t, rId); err != nil {
+		return common.RecordId{}, err
 	}
-
-	// Delete old version, insert new one. Both write their own WAL records.
 	if err := th.MarkTupleAsDeleted(t, rId); err != nil {
 		return common.RecordId{}, err
 	}
@@ -416,7 +471,8 @@ func (th *TableHeap) UpdateTuple(
 }
 
 // checkUpdateConflict returns ErrSerializationFailure if another in-flight
-// transaction has claimed this row's xmax.
+// transaction has claimed this row's xmax, or ErrTupleNotFound if the row is
+// no longer visible to the caller.
 func (th *TableHeap) checkUpdateConflict(
 	t *transaction.Transaction,
 	rId common.RecordId,
@@ -440,33 +496,9 @@ func (th *TableHeap) checkUpdateConflict(
 	if !th.visibleTo(t, header) {
 		return ErrTupleNotFound
 	}
+	// An in-flight transaction has already claimed the row — conflict.
 	if header.XMax != 0 && th.tm.IsInProgress(header.XMax) {
 		return transaction.ErrSerializationFailure
-	}
-	return nil
-}
-
-// checkCurrentVersionExists (pessimistic path) verifies after locking that the
-// row hasn't been committed-deleted since the snapshot was taken.
-func (th *TableHeap) checkCurrentVersionExists(rId common.RecordId) error {
-	tag := buffer.BufferTag{RelationID: th.rel, ForkID: th.fork, BlockID: rId.BlockID}
-	frame, err, _ := th.bp.GetPage(tag)
-	if err != nil {
-		return fmt.Errorf("get page %d: %w", rId.BlockID, err)
-	}
-	frame.RLatch()
-	defer func() { frame.RUnlatch(); frame.Unpin() }()
-
-	heapPage := &heap.HeapPage{Page: frame.Page}
-	if !heapPage.DoesTupleInSlotExist(rId.Slot) {
-		return ErrTupleNotFound
-	}
-	header, err := heapPage.GetTupleHeader(rId.Slot)
-	if err != nil {
-		return err
-	}
-	if header.XMax != 0 && !th.tm.IsInProgress(header.XMax) {
-		return ErrTupleNotFound
 	}
 	return nil
 }
@@ -476,7 +508,9 @@ func (th *TableHeap) checkCurrentVersionExists(rId common.RecordId) error {
 // -----------------------------------------------------------------------------
 
 // SelectForUpdate reads the current version of the row and takes an exclusive
-// lock on it, held until commit. Backs SQL SELECT ... FOR UPDATE.
+// lock on it. With no lock manager wired in, LockRow is a no-op — the lock
+// does not block other writers. Semantics are optimistic; this is expected
+// to be replaced by xmax-based row locks once that refactor lands.
 func (th *TableHeap) SelectForUpdate(
 	t *transaction.Transaction,
 	rId common.RecordId,
@@ -489,7 +523,7 @@ func (th *TableHeap) SelectForUpdate(
 	return th.currentVersion(rId, schema)
 }
 
-// SelectForShare is the shared-lock variant, held until commit.
+// SelectForShare is the shared-lock variant.
 func (th *TableHeap) SelectForShare(
 	t *transaction.Transaction,
 	rId common.RecordId,

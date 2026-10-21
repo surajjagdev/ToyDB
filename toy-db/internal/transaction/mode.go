@@ -1,22 +1,24 @@
 package transaction
 
-type TransactionMode uint8
+// IsolationLevel dictates how the transaction handles visibility and conflicts.
+type IsolationLevel uint8
 
 const (
-	// Optimistic: writes proceed without row locks. Conflicts are detected
-	// when a writer tries to set xmax on a tuple already being modified by
-	// another transaction, or at commit time. The transaction aborts with
-	// ErrSerializationFailure; the client retries.
-	Optimistic TransactionMode = iota + 1
+	// default
+	ReadCommitted IsolationLevel = iota + 1
 
-	// Pessimistic: writes acquire an exclusive lock on the target row,
-	// held to commit. Conflicts block rather than abort. This is the
-	// "SELECT FOR UPDATE is implicit on every write" mode.
-	Pessimistic
+	// repeatable read
+	SnapshotIsolation
 )
 
-// BeginOptions configures a new transaction.
+// BeginOptions configures a new transaction before it starts.
 type BeginOptions struct {
-	// Mode selects the write-side strategy. Zero means Optimistic.
-	Mode TransactionMode
+	// IsolationLevel selects the visibility and conflict strategy.
+	// If zero, the TransactionManager will default to SnapshotIsolation.
+	IsolationLevel IsolationLevel
+
+	// ReadOnly is a performance optimization. If true, the transaction
+	// will not be assigned a physical TransactionID (saving XID space)
+	// and will be forbidden from writing to the WAL or tables.
+	ReadOnly bool
 }

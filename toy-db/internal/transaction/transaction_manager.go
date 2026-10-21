@@ -7,8 +7,8 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/surajjagdev/ToyDB/internal/clog"
 	"github.com/surajjagdev/ToyDB/internal/common"
-	"github.com/surajjagdev/ToyDB/internal/lock"
 	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
@@ -18,33 +18,52 @@ var (
 	ErrTxAborted            = errors.New("tx: transaction aborted")
 )
 
-// Manager allocates transaction IDs, constructs snapshots, tracks active
-// transactions, and drives commit/abort through the WAL and lock manager.
+// Special transaction IDs. These reserve the low xid space for system
+// purposes and are treated as "always committed" by visibility checks.
+const (
+	InvalidXID   common.TransactionID = 0
+	BootstrapXID common.TransactionID = 1
+	FrozenXID    common.TransactionID = 2
+)
+
+// TransactionManager allocates transaction IDs, constructs snapshots, tracks
+// active transactions, and drives commit/abort through the WAL and CLOG.
+//
+// The WAL is the source of truth for durability; the CLOG is a persistent,
+// O(1) index over the commit status of every transaction. During normal
+// operation CLOG lives in memory and its file is flushed lazily. After a
+// crash, recovery rebuilds CLOG from the WAL, so any unflushed CLOG writes
+// are repaired automatically.
 type TransactionManager struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
-	wal   *wal.WAL
-	locks *lock.Manager
+	wal  *wal.WAL
+	clog *clog.Manager
 
-	nextTxID common.TransactionID
-	active   map[common.TransactionID]*Transaction
-	// sortedActive is kept sorted by txid so snapshot construction is cheap.
+	nextTxID     common.TransactionID
+	active       map[common.TransactionID]*Transaction
 	sortedActive []common.TransactionID
 }
 
-func NewManager(w *wal.WAL, locks *lock.Manager) *TransactionManager {
+func NewManager(w *wal.WAL, c *clog.Manager) *TransactionManager {
 	return &TransactionManager{
 		wal:      w,
-		locks:    locks,
-		nextTxID: 1, // 0 is InvalidTransactionID
+		clog:     c,
+		nextTxID: 3, // 0=Invalid, 1=Bootstrap, 2=Frozen
 		active:   make(map[common.TransactionID]*Transaction),
 	}
 }
 
-// Begin allocates a transaction ID, takes a snapshot, and starts the tx.
+// -----------------------------------------------------------------------------
+// Begin
+// -----------------------------------------------------------------------------
+
+// Begin allocates a transaction ID, takes a snapshot, and writes the Begin
+// record to the WAL. The Begin record is buffered; it only becomes durable
+// if the transaction later commits.
 func (m *TransactionManager) Begin(ctx context.Context, opts BeginOptions) (*Transaction, error) {
-	if opts.Mode == 0 {
-		opts.Mode = Optimistic
+	if opts.IsolationLevel == 0 {
+		opts.IsolationLevel = ReadCommitted
 	}
 
 	m.mu.Lock()
@@ -54,20 +73,19 @@ func (m *TransactionManager) Begin(ctx context.Context, opts BeginOptions) (*Tra
 	snap := m.buildSnapshotLocked(id)
 
 	tx := &Transaction{
-		Id:       id,
-		State:    Active,
-		Mode:     opts.Mode,
-		Snapshot: snap,
-		manager:  m,
-		ctx:      ctx,
+		Id:             id,
+		State:          Active,
+		IsolationLevel: opts.IsolationLevel,
+		Snapshot:       snap,
+		manager:        m,
+		ctx:            ctx,
+		done:           make(chan struct{}),
 	}
 
 	m.active[id] = tx
 	m.insertActiveSortedLocked(id)
 	m.mu.Unlock()
 
-	// Log Begin with the snapshot embedded, so recovery knows who was in
-	// flight at this tx's start.
 	beginPayload := encodeSnapshot(snap)
 	lsn, err := m.wal.Append(&wal.Record{
 		TxID: id,
@@ -86,8 +104,23 @@ func (m *TransactionManager) Begin(ctx context.Context, opts BeginOptions) (*Tra
 	return tx, nil
 }
 
-// Commit marks the transaction durable. Blocks until the commit record is
-// flushed. Releases all row locks on success.
+// -----------------------------------------------------------------------------
+// Commit
+// -----------------------------------------------------------------------------
+
+// Commit writes the Commit record, makes it durable, records the outcome in
+// the CLOG, and removes the transaction from the active set.
+//
+// Durability order:
+//  1. Append RecCommit to WAL
+//  2. FlushUpTo(commitLSN) — this is the point of no return
+//  3. SetStatus(Committed) in CLOG
+//  4. Cleanup (drop from active set, close done channel)
+//
+// If the process crashes between steps 2 and 3, the WAL commit record is
+// durable and recovery will populate CLOG from it. If it crashes between 3
+// and 4, the CLOG already says Committed, and recovery is a no-op for this
+// transaction.
 func (m *TransactionManager) Commit(tx *Transaction) error {
 	m.mu.Lock()
 	if tx.State != Active {
@@ -103,41 +136,48 @@ func (m *TransactionManager) Commit(tx *Transaction) error {
 		Type:    wal.RecCommit,
 	})
 	if err != nil {
-		// Leave state as Committing; caller decides whether to retry or
-		// abort.
 		return fmt.Errorf("wal commit: %w", err)
 	}
 
-	// Durability barrier. Blocks until the commit record is fsynced, which
-	// may batch with other commits in flight.
+	// Durability barrier. Batches with other concurrent commits.
 	if err := m.wal.FlushUpTo(commitLSN); err != nil {
 		return fmt.Errorf("wal flush: %w", err)
 	}
 
-	// At this point the tx is durable. Clean up in-memory state.
-	m.locks.ReleaseAll(tx.Id)
+	// The commit is durable. Record the outcome in CLOG so subsequent
+	// visibility checks can resolve this xid without scanning the WAL.
+	if m.clog != nil {
+		if err := m.clog.SetStatus(tx.Id, clog.Committed); err != nil {
+			// CLOG failure here does not undo the commit — the transaction
+			// IS durable. Recovery will reconcile CLOG from the WAL. We
+			// return the error so the caller knows the visibility cache is
+			// stale, but the transaction should be considered committed.
+			return fmt.Errorf("clog set committed (tx is durable, visibility may be stale): %w", err)
+		}
+	}
 
 	m.mu.Lock()
 	delete(m.active, tx.Id)
 	m.removeActiveSortedLocked(tx.Id)
 	tx.State = Committed
 	tx.LastLSN = commitLSN
+	close(tx.done)
 	m.mu.Unlock()
 	return nil
 }
 
-// Abort rolls back the transaction by walking its undo chain. Writes a CLR
-// for every undo so a crash mid-abort doesn't redo work.
-// Abort rolls back the transaction by walking its undo chain backwards.
-// Every undone record gets a CLR whose PrevLSN is the *undone record's*
-// PrevLSN, so a crash mid-abort picks up exactly where it left off.
+// -----------------------------------------------------------------------------
+// Abort
+// -----------------------------------------------------------------------------
+
+// Abort rolls back the transaction by walking its undo chain backwards,
+// applying each record's before-image and writing a CLR. Then writes the
+// Abort record, flushes it, and records the outcome in CLOG.
 //
 // If applier is nil, the undo walk is skipped. Callers pass nil when the
-// transaction has no durable effects to reverse — either because it never
-// logged a WAL record with a before-image, or because the caller already
-// knows nothing needs undoing (tests using a no-op WAL, or a transaction
-// that only read). The Abort record is still written so recovery classifies
-// the tx as a loser.
+// transaction has no durable effects to reverse (read-only transactions,
+// failed pre-checks, or tests with a no-op WAL). The Abort record is still
+// written so recovery classifies the transaction as a loser.
 func (m *TransactionManager) Abort(tx *Transaction, applier UndoApplier) error {
 	m.mu.Lock()
 	if tx.State != Active && tx.State != Committing {
@@ -147,7 +187,6 @@ func (m *TransactionManager) Abort(tx *Transaction, applier UndoApplier) error {
 	tx.State = Aborting
 	m.mu.Unlock()
 
-	// Walk the undo chain backwards, if we have an applier.
 	if applier != nil {
 		lsn := tx.LastLSN
 		for lsn != 0 {
@@ -160,7 +199,6 @@ func (m *TransactionManager) Abort(tx *Transaction, applier UndoApplier) error {
 					return fmt.Errorf("apply before-image at %v: %w", lsn, err)
 				}
 			}
-			// CLR: its PrevLSN skips the record we just undid.
 			clrLSN, err := m.wal.Append(&wal.Record{
 				TxID:    tx.Id,
 				PrevLSN: rec.PrevLSN,
@@ -187,26 +225,204 @@ func (m *TransactionManager) Abort(tx *Transaction, applier UndoApplier) error {
 		return fmt.Errorf("wal flush abort: %w", err)
 	}
 
-	m.locks.ReleaseAll(tx.Id)
+	if m.clog != nil {
+		if err := m.clog.SetStatus(tx.Id, clog.Aborted); err != nil {
+			return fmt.Errorf("clog set aborted (abort is durable, visibility may be stale): %w", err)
+		}
+	}
 
 	m.mu.Lock()
 	delete(m.active, tx.Id)
 	m.removeActiveSortedLocked(tx.Id)
 	tx.State = Aborted
 	tx.LastLSN = abortLSN
+	close(tx.done)
 	m.mu.Unlock()
 	return nil
 }
 
-// ActiveCount returns the number of in-flight transactions. Useful for
-// metrics and for tests.
+// -----------------------------------------------------------------------------
+// Queries
+// -----------------------------------------------------------------------------
+
+// ActiveCount returns the number of in-flight transactions.
 func (m *TransactionManager) ActiveCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.active)
 }
 
-// ---- internal ----
+// IsInProgress reports whether txid is currently running.
+func (m *TransactionManager) IsInProgress(txid common.TransactionID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.active[txid]
+	return ok
+}
+
+// IsCommitted reports whether txid's changes are durable and visible.
+//
+// Resolution order:
+//  1. Special xids (0, 1, 2) — Bootstrap and Frozen are visible; Invalid
+//     should never appear on a tuple, but returning true is harmless.
+//  2. Active transaction → false (still running, may abort).
+//  3. CLOG Committed → true; Aborted → false.
+//  4. CLOG InProgress (unknown) → true.
+//
+// Rule 4 is a fail-open default for tuples whose xid predates this CLOG
+// instance. After recovery completes, every xid that ever existed is in the
+// CLOG, so rule 4 only fires for genuinely ancient data — treating it as
+// committed matches the assumption that it was committed long ago.
+func (m *TransactionManager) IsCommitted(xid common.TransactionID) (bool, error) {
+	if xid <= FrozenXID {
+		return true, nil
+	}
+
+	m.mu.RLock()
+	_, active := m.active[xid]
+	m.mu.RUnlock()
+	if active {
+		return false, nil
+	}
+
+	if m.clog == nil {
+		// No CLOG configured: assume committed. This is the pre-CLOG
+		// behavior and is correct only in tests without real aborts.
+		return true, nil
+	}
+
+	s, err := m.clog.GetStatus(xid)
+	if err != nil {
+		return false, err
+	}
+	switch s {
+	case clog.Committed:
+		return true, nil
+	case clog.Aborted:
+		return false, nil
+	default:
+		// InProgress — unknown. Fail-open as documented above.
+		return true, nil
+	}
+}
+
+// GetTxnState returns the state of a transaction. Same resolution rules as
+// IsCommitted, mapped to the State enum.
+func (m *TransactionManager) GetTxnState(xid common.TransactionID) State {
+	if xid <= FrozenXID {
+		return Committed
+	}
+
+	m.mu.RLock()
+	_, active := m.active[xid]
+	m.mu.RUnlock()
+	if active {
+		return Active
+	}
+
+	if m.clog == nil {
+		return Committed
+	}
+
+	s, err := m.clog.GetStatus(xid)
+	if err != nil {
+		return Committed // fail-open
+	}
+	switch s {
+	case clog.Committed:
+		return Committed
+	case clog.Aborted:
+		return Aborted
+	default:
+		return Committed // fail-open
+	}
+}
+
+// ActiveTxIDs returns a sorted snapshot of running transaction IDs. Used by
+// the checkpoint manager to embed in a checkpoint record.
+func (m *TransactionManager) ActiveTxIDs() []common.TransactionID {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]common.TransactionID, len(m.sortedActive))
+	copy(out, m.sortedActive)
+	return out
+}
+
+// NextTxID returns the next transaction ID that will be allocated. Used by
+// recovery to resume allocation after scanning the WAL.
+func (m *TransactionManager) NextTxID() common.TransactionID {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.nextTxID
+}
+
+// -----------------------------------------------------------------------------
+// Wait-for-completion
+// -----------------------------------------------------------------------------
+
+// WaitForTxn blocks until targetXid has committed or aborted, or ctx is
+// cancelled. If targetXid is already finished (or was never active), it
+// returns immediately.
+func (m *TransactionManager) WaitForTxn(ctx context.Context, targetXid common.TransactionID) error {
+	m.mu.RLock()
+	targetTx, isActive := m.active[targetXid]
+	m.mu.RUnlock()
+
+	if !isActive {
+		return nil
+	}
+
+	select {
+	case <-targetTx.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Recovery-facing
+// -----------------------------------------------------------------------------
+
+// RecordState records the final state of a transaction in the CLOG. Used by
+// recovery to populate the CLOG after the analysis pass (committed) and the
+// undo pass (aborted).
+//
+// Must be called only during recovery, before the database accepts client
+// connections. Requires a non-nil CLOG.
+func (m *TransactionManager) RecordState(xid common.TransactionID, state State) error {
+	if m.clog == nil {
+		return fmt.Errorf("tx: RecordState requires CLOG")
+	}
+	switch state {
+	case Committed:
+		return m.clog.SetStatus(xid, clog.Committed)
+	case Aborted:
+		return m.clog.SetStatus(xid, clog.Aborted)
+	default:
+		return fmt.Errorf("tx: RecordState called with non-final state %v", state)
+	}
+}
+
+// ResetForRecovery replaces the manager's dynamic state with values derived
+// from the WAL. It clears the active set and sets nextTxID for future
+// allocation.
+//
+// Called by the recovery driver after analysis and undo complete, before
+// client traffic is accepted. Any transaction that was active at crash time
+// must already have been resolved by the undo pass.
+func (m *TransactionManager) ResetForRecovery(nextTxID common.TransactionID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.active = make(map[common.TransactionID]*Transaction)
+	m.sortedActive = nil
+	m.nextTxID = nextTxID
+}
+
+// -----------------------------------------------------------------------------
+// Internal helpers
+// -----------------------------------------------------------------------------
 
 func (m *TransactionManager) buildSnapshotLocked(id common.TransactionID) Snapshot {
 	snap := Snapshot{XMax: m.nextTxID}
@@ -240,28 +456,20 @@ func (m *TransactionManager) removeActiveSortedLocked(id common.TransactionID) {
 	}
 }
 
-// IsInProgress reports whether txid is currently running — i.e., it has
-// begun but not yet committed or aborted.
-//
-// Used by MVCC visibility: a tuple's XMax set by an in-progress transaction
-// does not (yet) hide the tuple from anyone. A tuple's XMin set by an
-// in-progress transaction is not yet visible to anyone but the writer itself.
-func (m *TransactionManager) IsInProgress(txid common.TransactionID) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_, ok := m.active[txid]
-	return ok
-}
+// -----------------------------------------------------------------------------
+// Interfaces and codecs
+// -----------------------------------------------------------------------------
 
-// UndoApplier is implemented by the heap. Called during Abort and during
-// recovery's undo pass.
+// UndoApplier is implemented by the storage layer (heap). Called during Abort
+// and during recovery's undo pass. Implementations must be idempotent under
+// repeated application.
 type UndoApplier interface {
 	ApplyBeforeImage(rec *wal.Record) error
 }
 
-// encodeSnapshot encodes a Snapshot into a WAL payload. Format:
+// encodeSnapshot produces the RecBegin payload.
 //
-//	XMin(4) | XMax(4) | count(4) | id_0(4) ... id_n(4)
+// Layout: XMin(4) | XMax(4) | count(4) | id_0(4) ... id_n(4)
 func encodeSnapshot(s Snapshot) []byte {
 	buf := make([]byte, 12+4*len(s.InProgress))
 	common.ByteOrder.PutUint32(buf[0:], uint32(s.XMin))
@@ -273,6 +481,8 @@ func encodeSnapshot(s Snapshot) []byte {
 	return buf
 }
 
+// encodeCLR produces the RecClear payload: the LSN of the record being
+// undone.
 func encodeCLR(undoneLSN wal.LSN) []byte {
 	buf := make([]byte, 8)
 	common.ByteOrder.PutUint64(buf, uint64(undoneLSN))

@@ -7,6 +7,7 @@ import (
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/page"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
 /*
@@ -60,6 +61,12 @@ type Frame struct {
 	ioMu sync.Mutex
 
 	ioCond *sync.Cond
+
+	// recLSN is the LSN of the earliest WAL record that dirtied this frame
+	// since it was last flushed. Zero means the frame is either clean or
+	// was dirtied without a WAL record (e.g. by AllocatePage, which is
+	// currently not WAL-logged).
+	recLSN atomic.Uint64
 
 	ptr unsafe.Pointer // only used on Linux for aligned pages
 
@@ -348,6 +355,25 @@ func (f *Frame) WaitIO() {
 	}
 	f.ioMu.Unlock()
 }
+
+func (f *Frame) RecLSN() wal.LSN { return wal.LSN(f.recLSN.Load()) }
+
+func (f *Frame) setRecLSN(lsn wal.LSN) {
+	if lsn == 0 {
+		return
+	}
+	for {
+		old := f.recLSN.Load()
+		if old != 0 && old <= uint64(lsn) {
+			return // earlier or equal already recorded
+		}
+		if f.recLSN.CompareAndSwap(old, uint64(lsn)) {
+			return
+		}
+	}
+}
+
+func (f *Frame) clearRecLSN() { f.recLSN.Store(0) }
 
 // -----------------------------------------------------------------------------
 // Reset

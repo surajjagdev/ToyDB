@@ -235,7 +235,120 @@ func CalculateBytesNeededToInsertTuple(dataLen int, nullBitmapLen int) (hoff int
 	return hoff, tupleSize, tupleSize + ItemIdSize
 }
 
+// BuildTupleBytes produces the exact bytes that will occupy a slot when this
+// tuple is installed, without modifying the page.
+//
+// It exists so callers can log the tuple to the WAL before mutating memory
+// (the write-ahead rule). The returned bytes include the full HeapTupleHeader
+// (xmin, xmax, cid, ctid, infomask, infomask2, hoff), the null bitmap, user
+// data, and any trailing alignment padding — everything the slot will hold.
+//
+// slot and blockID fill the tuple's ctid. The caller should have obtained
+// slot from NextSlot() and hold the page's write latch across Build + Install
+// so the two agree.
+func (h *HeapPage) BuildTupleBytes(
+	data []byte,
+	nullBitmap []byte,
+	blockID common.BlockID,
+	slot common.SlotIndex,
+	xmin common.TransactionID,
+	xmax common.TransactionID,
+	cid common.CommandID,
+) []byte {
+	hoff, tupleSize, _ := CalculateBytesNeededToInsertTuple(len(data), len(nullBitmap))
+
+	// Zero-initialised; trailing padding is already 0.
+	buf := make([]byte, tupleSize)
+
+	// --- fixed header ---
+	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetXmin:], uint32(xmin))
+	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetXmax:], uint32(xmax))
+	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetCid:], uint32(cid))
+
+	// ctid: self-location.
+	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetCtid:], uint32(blockID))
+	common.ByteOrder.PutUint16(buf[TupleHeaderOffsetCtid+4:], uint16(slot))
+
+	// infomask: HEAP_HASNULL if a null bitmap is present.
+	infomask := uint16(0)
+	if len(nullBitmap) > 0 {
+		infomask |= 0x0001
+		copy(buf[HeapTupleHeaderMinSize:], nullBitmap)
+	}
+	common.ByteOrder.PutUint16(buf[TupleHeaderOffsetInfomask:], infomask)
+	common.ByteOrder.PutUint16(buf[TupleHeaderOffsetInfomask2:], 0)
+
+	// hoff: offset where user data begins.
+	buf[TupleHeaderOffsetHoff] = uint8(hoff)
+
+	// --- user data ---
+	copy(buf[int(hoff):], data)
+
+	return buf
+}
+
+// InstallTuple writes a pre-built tuple blob into the given slot, updating
+// the page's slot array and upper pointer. The caller must hold the write
+// latch and must have verified there is room for
+// len(tupleBytes) + ItemIdSize bytes on the page.
+//
+// The ctid embedded in tupleBytes is trusted — the caller is responsible
+// for producing the blob with BuildTupleBytes using the same slot passed
+// here.
+func (h *HeapPage) InstallTuple(
+	slot common.SlotIndex,
+	tupleBytes []byte,
+) (common.RecordId, error) {
+	lower := h.GetLower()
+	upper := h.GetUpper()
+
+	// The slot must be exactly the next free slot. If not, either the caller
+	// peeked the wrong slot or something changed the page under the latch
+	// (which would be a bug).
+	expectedSlot := common.SlotIndex((lower - page.PageHeaderSize) / ItemIdSize)
+	if slot != expectedSlot {
+		return common.RecordId{}, fmt.Errorf(
+			"InstallTuple: slot %d does not match next free slot %d",
+			slot, expectedSlot)
+	}
+
+	tupleSize := len(tupleBytes)
+	if int(upper-lower) < tupleSize+ItemIdSize {
+		return common.RecordId{}, fmt.Errorf(
+			"InstallTuple: page full (need %d, have %d)",
+			tupleSize+ItemIdSize, upper-lower)
+	}
+
+	// --- allocate tuple space from upper ---
+	newUpper := upper - uint16(tupleSize)
+	tupleOffset := newUpper
+	h.SetUpper(newUpper)
+
+	copy(h.Page[tupleOffset:tupleOffset+uint16(tupleSize)], tupleBytes)
+
+	// --- write the ItemId slot ---
+	slotOffset := lower
+	h.SetLower(lower + ItemIdSize)
+
+	itemID := uint32(0)
+	itemID |= uint32(tupleOffset) << 17      // 15-bit offset
+	itemID |= uint32(ItemIdFlagNormal) << 15 // 2-bit flags
+	itemID |= uint32(tupleSize)              // 15-bit size
+	common.ByteOrder.PutUint32(h.Page[slotOffset:slotOffset+ItemIdSize], itemID)
+
+	// --- return the identity, read from the blob's ctid ---
+	blockID := common.BlockID(
+		common.ByteOrder.Uint32(tupleBytes[TupleHeaderOffsetCtid:]))
+	return common.RecordId{BlockID: blockID, Slot: slot}, nil
+}
+
 // Insert a single tuple into the page
+// InsertTuple inserts a tuple into the page using a fresh slot. It is a
+// convenience wrapper around BuildTupleBytes + InstallTuple for callers that
+// don't need to log the bytes to the WAL separately (tests, replay).
+//
+// Production callers (TableHeap.InsertTuple) should use Build + WAL append +
+// Install so the write-ahead rule is enforced.
 func (h *HeapPage) InsertTuple(
 	data []byte,
 	nullBitmap []byte,
@@ -243,111 +356,12 @@ func (h *HeapPage) InsertTuple(
 	xmin common.TransactionID,
 	cid common.CommandID,
 ) (common.RecordId, error) {
-
-	// 1., 2. Compute header offset (aligned) and tuple size (aligned)
-	hoff, tupleSize, requiredSpace := CalculateBytesNeededToInsertTuple(len(data), len(nullBitmap))
-
-	upper := h.GetUpper()
-	lower := h.GetLower()
-
-	// 3. Check available space
-	if int(upper-lower) < requiredSpace {
-		return common.RecordId{}, fmt.Errorf("page is full")
+	slot, err := h.NextSlot()
+	if err != nil {
+		return common.RecordId{}, err
 	}
-
-	// 4. Allocate space from upper (tuples grow downward)
-	newUpper := upper - uint16(tupleSize)
-	tupleOffset := newUpper
-	h.SetUpper(newUpper)
-
-	// 5. Slice tuple space
-	tuple := h.Page[tupleOffset : tupleOffset+uint16(tupleSize)]
-
-	// ---- tuple header ----
-
-	// xmin
-	common.ByteOrder.PutUint32(
-		tuple[TupleHeaderOffsetXmin:TupleHeaderOffsetXmin+4],
-		uint32(xmin),
-	)
-
-	// xmax (not deleted)
-	common.ByteOrder.PutUint32(
-		tuple[TupleHeaderOffsetXmax:TupleHeaderOffsetXmax+4],
-		0,
-	)
-
-	// command id
-	common.ByteOrder.PutUint32(
-		tuple[TupleHeaderOffsetCid:TupleHeaderOffsetCid+4],
-		uint32(cid),
-	)
-
-	// NEW: Write Null Bitmap and set Infomask flag
-	infomask := uint16(0)
-	if len(nullBitmap) > 0 {
-		// heap has null
-		infomask |= 0x0001
-
-		// The Null Bitmap after tuple header byte 23
-		copy(tuple[HeapTupleHeaderMinSize:], nullBitmap)
-	}
-
-	// infomask
-	common.ByteOrder.PutUint16(
-		tuple[TupleHeaderOffsetInfomask:TupleHeaderOffsetInfomask+2],
-		infomask,
-	)
-
-	// infomask2 - number of attrs
-	common.ByteOrder.PutUint16(
-		tuple[TupleHeaderOffsetInfomask2:TupleHeaderOffsetInfomask2+2],
-		0,
-	)
-
-	// hoff (aligned header size)
-	tuple[TupleHeaderOffsetHoff] = uint8(hoff)
-
-	// ---- user data ----
-	copy(tuple[int(hoff):], data)
-
-	// zero memory for padding
-	for i := int(hoff) + len(data); i < len(tuple); i++ {
-		tuple[i] = 0
-	}
-
-	// ---- itemId slot ----
-
-	slotOffset := lower
-	h.SetLower(lower + ItemIdSize)
-
-	slotIndex := (slotOffset - page.PageHeaderSize) / ItemIdSize
-
-	itemId := uint32(0)
-	itemId |= uint32(tupleOffset) << 17      // offset (15 bits)
-	itemId |= uint32(ItemIdFlagNormal) << 15 // flags (2 bits)
-	itemId |= uint32(tupleSize)              // size (15 bits)
-
-	common.ByteOrder.PutUint32(
-		h.Page[slotOffset:slotOffset+4],
-		itemId,
-	)
-
-	// ---- self ctid ----
-
-	common.ByteOrder.PutUint32(
-		tuple[TupleHeaderOffsetCtid:],
-		uint32(pageId),
-	)
-	common.ByteOrder.PutUint16(
-		tuple[TupleHeaderOffsetCtid+4:],
-		uint16(slotIndex),
-	)
-
-	return common.RecordId{
-		BlockID: pageId,
-		Slot:    common.SlotIndex(slotIndex),
-	}, nil
+	blob := h.BuildTupleBytes(data, nullBitmap, pageId, slot, xmin, 0, cid)
+	return h.InstallTuple(slot, blob)
 }
 
 // In internal/storage/page/heap/heap.go:
