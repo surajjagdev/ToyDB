@@ -19,7 +19,7 @@ import (
 // | Tuple data         |  grows downward
 // +--------------------+  OffsetUpper
 // | Special area       |
-// +--------------------+
+// +--------------------+  OffsetUpper
 
 // Heap Page
 // everything as Base
@@ -31,35 +31,37 @@ Heap Page Layout
 
 [ Page Header | ItemId[] | free space | Tuples | Special ]
 
-ItemId:
--15 bit for tuple offset
-- 2 bit for flags
-- 15 bit for tuple size
+ItemId (4 bytes, 8 KB pages):
+- 13 bits for tuple size  (max 8191)
+-  6 bits for flags        (values 0-63)
+- 13 bits for tuple offset (max 8191)
 
 Tuple Layout:
 [ HeapTupleHeader | UserData ]
 */
-// before the tuples
 const (
-	ItemIdSize = 4 // 4 bytes per slot, containing tuple offset, flag and tuple size
+	ItemIdSize = 4 // 4 bytes per slot: size, flags, offset
 )
 
 const (
-	// item id flags
-	// slot never used and can be reused
-	ItemIdFlagUnused = 1 << 0
-	// slot points to live tuple
-	ItemIdFlagNormal = 1 << 1
-	//Slot does not point to a tuple, points to another slot. hot update, index points to this slot, but this slots points
-	// to another slot in same page
-	ItemIdRedirect = 1 << 2
+	// ItemIdFlagUnused: the slot was allocated but currently holds no
+	// tuple. Reusable by the next InsertTuple that needs a slot.
+	ItemIdFlagUnused = 1 << 0 // 0b0001
 
-	//tuple is deleted, can be vaccummed
-	ItemIdDeleted = 1 << 3 // only mark via vaccumm, so indexes can lazily remove
+	// ItemIdFlagNormal: the slot points at a live tuple.
+	ItemIdFlagNormal = 1 << 1 // 0b0010
+
+	// ItemIdFlagRedirect: the slot points at another slot in the same page.
+	// Reserved for HOT updates.
+	ItemIdFlagRedirect = 1 << 2 // 0b0100
+
+	// ItemIdFlagDeleted: the tuple is logically deleted. Vacuum will
+	// convert this to ItemIdFlagUnused after reclaiming the tuple bytes.
+	ItemIdFlagDeleted = 1 << 3 // 0b1000
 )
 
 const (
-	// Transaction / command stamps
+	// Transaction / command stamps.
 	// txn of the transaction that created this tuple - visibility
 	TupleHeaderOffsetXmin = 0 // uint32
 	// txn of the transaction that deleted this tuple - visibility
@@ -70,13 +72,13 @@ const (
 	// current tuple ID. can point to self, new version, or another tuple
 	TupleHeaderOffsetCtid = 12 // ItemPointerData (6 bytes)
 
-	// Visibility & metadata
+	// Visibility & metadata.
 	// tuple has NULLs, tuple was updated, xmax committed / aborted, tuple moved by vacuum
 	TupleHeaderOffsetInfomask2 = 18 // uint16
 	// number of attributes & HOT / key-update flags.
 	// 0-10 bits for number of attributes, 11-15 bits for HOT / key-update flags
 	TupleHeaderOffsetInfomask = 20 // uint16
-	//Byte offset from tuple start to first attribute, fixed header, null bitmap, padding for alignment
+	// Byte offset from tuple start to first attribute, fixed header, null bitmap, padding for alignment
 	TupleHeaderOffsetHoff = 22 // uint8 -> null bitmap
 
 	// Header sizes
@@ -95,8 +97,7 @@ type TupleHeader struct {
 	Cid  common.CommandID
 }
 
-// Assuming page already alloc'ed, set the
-// page header and flags
+// InitHeapPage initializes an already-allocated page as a heap page.
 func InitHeapPage(p page.Page) *HeapPage {
 	page.InitBasePage(p, page.PageFlagHeap)
 
@@ -105,12 +106,11 @@ func InitHeapPage(p page.Page) *HeapPage {
 	p.SetUpper(uint16(common.PageSize))
 	p.SetSpecial(uint16(common.PageSize))
 
-	return &HeapPage{
-		p,
-	}
+	return &HeapPage{p}
 }
 
-// Get the avail free space
+// GetFreeSpace returns the number of bytes available for new tuples and
+// slot entries.
 func (h *HeapPage) GetFreeSpace() int {
 	return int(h.GetUpper() - h.GetLower())
 }
@@ -122,20 +122,9 @@ func (h *HeapPage) NextSlotIdx() common.SlotIndex {
 	return common.SlotIndex((h.GetLower() - page.PageHeaderSize) / ItemIdSize)
 }
 
-func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint16) {
-	// top 15 bits
-	offset = uint16(v >> 17)
-
-	// next 2 bits
-	twobitMask := uint32((1 << 2) - 1)
-	flags = uint8((v >> 15) & twobitMask)
-
-	// bottom 15 bits
-	fifteenBitMask := uint32(((1 << 15) - 1))
-	size = uint16(v & fifteenBitMask)
-
-	return offset, flags, size
-}
+// -----------------------------------------------------------------------------
+// ItemId encoding
+// -----------------------------------------------------------------------------
 
 // UnpackItemId decodes the 4-byte ItemId slot entry into (offset, flags, size).
 //
@@ -155,31 +144,50 @@ func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint
 	return
 }
 
-// get the slot index, based on slot position.
-// not guaranteed to exist
+// packItemId encodes (offset, flags, size) into a 4-byte ItemId. Inverse of
+// UnpackItemId. The caller must ensure offset and size fit in 13 bits
+// (max 8191) — values above are silently masked.
+func packItemId(offset uint16, flags uint8, size uint16) uint32 {
+	var v uint32
+	v |= uint32(offset) << 19
+	v |= (uint32(flags) & 0b111111) << 13
+	v |= uint32(size) & 0b1111111111111
+	return v
+}
+
+// -----------------------------------------------------------------------------
+// Slot array helpers
+// -----------------------------------------------------------------------------
+
+// getSlotOffset returns the byte offset of the ItemId slot entry for the
+// given logical slot index. Does not validate.
 func getSlotOffset(slot common.SlotIndex) int {
 	return page.PageHeaderSize + int(slot)*ItemIdSize
 }
 
+// validateSlot reports whether the given slot index is within the range of
+// slots that have been allocated on this page.
 func (h *HeapPage) validateSlot(slot common.SlotIndex) bool {
 	slotOffset := getSlotOffset(slot)
-
-	// slot is referring to unclaimed space, so it is
-	// not valid
 	if slotOffset+ItemIdSize > int(h.GetLower()) {
 		return false
 	}
-
 	return true
 }
+
+// GetNumSlots returns the number of slot entries currently allocated.
+func (h *HeapPage) GetNumSlots() int {
+	return int((h.GetLower() - page.PageHeaderSize) / ItemIdSize)
+}
+
+// -----------------------------------------------------------------------------
+// Tuple header access
+// -----------------------------------------------------------------------------
 
 // GetTupleHeader reads the MVCC header for the tuple in the given slot.
 //
 // Callers must hold at least a read latch on the page. The returned header
 // is a value copy; it does not alias the page buffer.
-//
-// Returns an error if the slot does not point at a live tuple, or if the
-// tuple is too small to hold a header (corruption).
 func (h *HeapPage) GetTupleHeader(slot common.SlotIndex) (TupleHeader, error) {
 	if !h.DoesTupleInSlotExist(slot) {
 		return TupleHeader{}, fmt.Errorf("no tuple in slot %d", slot)
@@ -206,72 +214,53 @@ func (h *HeapPage) GetTupleHeader(slot common.SlotIndex) (TupleHeader, error) {
 	}, nil
 }
 
-func (h *HeapPage) GetNumSlots() int {
-	return int((h.GetLower() - page.PageHeaderSize) / ItemIdSize)
-}
+// -----------------------------------------------------------------------------
+// Tuple reads
+// -----------------------------------------------------------------------------
 
-// Check if tuple exists using the slot number
+// DoesTupleInSlotExist reports whether the slot points at a live tuple.
 func (h *HeapPage) DoesTupleInSlotExist(slot common.SlotIndex) bool {
 	if !h.validateSlot(slot) {
 		return false
 	}
-
 	slotOffset := getSlotOffset(slot)
-	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
 	_, flags, _ := h.UnpackItemId(v)
-
-	// Only return true if the slot points to a live, normal tuple
 	return flags == ItemIdFlagNormal
 }
 
-// tuple crud
-
-// Get the tuple from page using the slot index.
-// Does not validate if slot index exists, so should be
-// done before
+// GetTupleWithSlot returns the tuple bytes for the given slot.
+// Does not validate the slot — callers should check
+// DoesTupleInSlotExist first.
 func (h *HeapPage) GetTupleWithSlot(slot common.SlotIndex) []byte {
 	slotOffset := getSlotOffset(slot)
-
-	// read the 4 bytes for item composed of tuple offset, flag and tuple size
-	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
 	offset, _, size := h.UnpackItemId(v)
 	return h.Page[offset : offset+size]
 }
 
-// Calculate the bytes needed to insert a tuple into the page
-// if null bitmap is not provided, nullBitmapLen should be 0
-// if data is not provided, dataLen should be 0
+// -----------------------------------------------------------------------------
+// Tuple construction
+// -----------------------------------------------------------------------------
 
-// Takes header offset + null bitmap length + data length and aligns to 8 bytes
-// then adds the item id size to get the total bytes needed to insert the tuple
-// dataLen -> length of the data to be inserted
-// nullBitmapLen -> length of the null bitmap
-// returns the bytes header offset, tuple size and the total bytes needed to insert the tuple
+// CalculateBytesNeededToInsertTuple computes (hoff, tupleSize, requiredSpace)
+// for a tuple with the given user-data and null-bitmap lengths.
 func CalculateBytesNeededToInsertTuple(dataLen int, nullBitmapLen int) (hoff int, tupleSize int, requiredSpace int) {
-	hoff = 0
-	tupleSize = 0
-	requiredSpace = 0
-
-	// calculate header offset -> minimum header without null bitmap + nullbitmap length -> align to 8 bytes
 	hoff = page.AlignTo(HeapTupleHeaderMinSize+nullBitmapLen, HeapTupleHeaderAlign)
-
-	// calculate tuple size -> header offset + data length -> align to 8 bytes
 	tupleSize = page.AlignTo(hoff+dataLen, HeapTupleHeaderAlign)
-
 	return hoff, tupleSize, tupleSize + ItemIdSize
 }
 
 // BuildTupleBytes produces the exact bytes that will occupy a slot when this
 // tuple is installed, without modifying the page.
 //
-// It exists so callers can log the tuple to the WAL before mutating memory
-// (the write-ahead rule). The returned bytes include the full HeapTupleHeader
-// (xmin, xmax, cid, ctid, infomask, infomask2, hoff), the null bitmap, user
-// data, and any trailing alignment padding — everything the slot will hold.
+// The returned bytes include the full HeapTupleHeader (xmin, xmax, cid,
+// ctid, infomask, infomask2, hoff), the null bitmap, user data, and any
+// trailing alignment padding — everything the slot will hold.
 //
 // slot and blockID fill the tuple's ctid. The caller should have obtained
-// slot from NextSlot() and hold the page's write latch across Build + Install
-// so the two agree.
+// slot from NextSlot() and hold the page's write latch across Build +
+// Install so the two agree.
 func (h *HeapPage) BuildTupleBytes(
 	data []byte,
 	nullBitmap []byte,
@@ -283,10 +272,8 @@ func (h *HeapPage) BuildTupleBytes(
 ) []byte {
 	hoff, tupleSize, _ := CalculateBytesNeededToInsertTuple(len(data), len(nullBitmap))
 
-	// Zero-initialised; trailing padding is already 0.
 	buf := make([]byte, tupleSize)
 
-	// --- fixed header ---
 	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetXmin:], uint32(xmin))
 	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetXmax:], uint32(xmax))
 	common.ByteOrder.PutUint32(buf[TupleHeaderOffsetCid:], uint32(cid))
@@ -304,23 +291,22 @@ func (h *HeapPage) BuildTupleBytes(
 	common.ByteOrder.PutUint16(buf[TupleHeaderOffsetInfomask:], infomask)
 	common.ByteOrder.PutUint16(buf[TupleHeaderOffsetInfomask2:], 0)
 
-	// hoff: offset where user data begins.
 	buf[TupleHeaderOffsetHoff] = uint8(hoff)
-
-	// --- user data ---
 	copy(buf[int(hoff):], data)
 
 	return buf
 }
 
+// -----------------------------------------------------------------------------
+// Install / insert
+// -----------------------------------------------------------------------------
+
 // InstallTuple writes a pre-built tuple blob into the given slot, updating
-// the page's slot array and upper pointer. The caller must hold the write
-// latch and must have verified there is room for
-// len(tupleBytes) + ItemIdSize bytes on the page.
+// the page's slot array and upper pointer.
 //
-// The ctid embedded in tupleBytes is trusted — the caller is responsible
-// for producing the blob with BuildTupleBytes using the same slot passed
-// here.
+// The slot must be the next free slot (i.e., equal to NextSlotIdx() before
+// this call). The caller must hold the write latch and must have verified
+// there is room for len(tupleBytes) + ItemIdSize bytes.
 func (h *HeapPage) InstallTuple(
 	slot common.SlotIndex,
 	tupleBytes []byte,
@@ -328,9 +314,6 @@ func (h *HeapPage) InstallTuple(
 	lower := h.GetLower()
 	upper := h.GetUpper()
 
-	// The slot must be exactly the next free slot. If not, either the caller
-	// peeked the wrong slot or something changed the page under the latch
-	// (which would be a bug).
 	expectedSlot := common.SlotIndex((lower - page.PageHeaderSize) / ItemIdSize)
 	if slot != expectedSlot {
 		return common.RecordId{}, fmt.Errorf(
@@ -345,36 +328,29 @@ func (h *HeapPage) InstallTuple(
 			tupleSize+ItemIdSize, upper-lower)
 	}
 
-	// --- allocate tuple space from upper ---
 	newUpper := upper - uint16(tupleSize)
 	tupleOffset := newUpper
 	h.SetUpper(newUpper)
 
 	copy(h.Page[tupleOffset:tupleOffset+uint16(tupleSize)], tupleBytes)
 
-	// --- write the ItemId slot ---
 	slotOffset := lower
 	h.SetLower(lower + ItemIdSize)
 
-	itemID := uint32(0)
-	itemID |= uint32(tupleOffset) << 17      // 15-bit offset
-	itemID |= uint32(ItemIdFlagNormal) << 15 // 2-bit flags
-	itemID |= uint32(tupleSize)              // 15-bit size
+	itemID := packItemId(tupleOffset, uint8(ItemIdFlagNormal), uint16(tupleSize))
 	common.ByteOrder.PutUint32(h.Page[slotOffset:slotOffset+ItemIdSize], itemID)
 
-	// --- return the identity, read from the blob's ctid ---
 	blockID := common.BlockID(
 		common.ByteOrder.Uint32(tupleBytes[TupleHeaderOffsetCtid:]))
 	return common.RecordId{BlockID: blockID, Slot: slot}, nil
 }
 
-// Insert a single tuple into the page
-// InsertTuple inserts a tuple into the page using a fresh slot. It is a
-// convenience wrapper around BuildTupleBytes + InstallTuple for callers that
-// don't need to log the bytes to the WAL separately (tests, replay).
+// InsertTuple is a convenience wrapper around BuildTupleBytes + InstallTuple
+// for callers that don't need to WAL-log the bytes separately (tests,
+// replay).
 //
-// Production callers (TableHeap.InsertTuple) should use Build + WAL append +
-// Install so the write-ahead rule is enforced.
+// Production callers (TableHeap.InsertTuple) should use Build + WAL append
+// + Install so the write-ahead rule is enforced.
 func (h *HeapPage) InsertTuple(
 	data []byte,
 	nullBitmap []byte,
@@ -390,7 +366,22 @@ func (h *HeapPage) InsertTuple(
 	return h.InstallTuple(slot, blob)
 }
 
-// In internal/storage/page/heap/heap.go:
+// NextSlot returns the slot index the next InstallTuple would claim, after
+// verifying there is room for one more slot entry.
+func (h *HeapPage) NextSlot() (common.SlotIndex, error) {
+	lower := h.GetLower()
+	slotIndex := (lower - page.PageHeaderSize) / ItemIdSize
+
+	if int(lower)+ItemIdSize > int(h.GetUpper()) {
+		return 0, fmt.Errorf("page has no room for a new slot")
+	}
+
+	return common.SlotIndex(slotIndex), nil
+}
+
+// -----------------------------------------------------------------------------
+// Delete
+// -----------------------------------------------------------------------------
 
 // CanDeleteTuple reports whether DeleteTuple would succeed for the given
 // slot, without mutating anything. Callers can use it to fail before writing
@@ -404,16 +395,16 @@ func (h *HeapPage) CanDeleteTuple(slot common.SlotIndex) error {
 	tupleOffset, flags, size := h.UnpackItemId(v)
 
 	switch flags {
-	case ItemIdFlagUnused:
+	case uint8(ItemIdFlagUnused):
 		return fmt.Errorf("tuple already removed")
-	case ItemIdDeleted:
+	case uint8(ItemIdFlagDeleted):
 		return fmt.Errorf("tuple already deleted")
-	case ItemIdRedirect:
+	case uint8(ItemIdFlagRedirect):
 		return fmt.Errorf("cannot delete redirect slot")
-	case ItemIdFlagNormal:
+	case uint8(ItemIdFlagNormal):
 		// ok
 	default:
-		return fmt.Errorf("unknown itemId flag")
+		return fmt.Errorf("unknown itemId flag %d", flags)
 	}
 
 	tuple := h.Page[tupleOffset : tupleOffset+size]
@@ -426,55 +417,43 @@ func (h *HeapPage) CanDeleteTuple(slot common.SlotIndex) error {
 	return nil
 }
 
-// Logical Deletion of tuple from page
+// DeleteTuple logically deletes the tuple at slot by stamping xmax.
 func (h *HeapPage) DeleteTuple(
 	slot common.SlotIndex,
 	xmax common.TransactionID,
 	cid common.CommandID,
 ) error {
-	// 1. validate the slot
 	slotOffset := getSlotOffset(slot)
 
 	if exists := h.validateSlot(slot); !exists {
 		return fmt.Errorf("invalid slot %d", slot)
 	}
 
-	// 2. get tuple slot
-	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+4])
-
-	// unpack the flags from tuple
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
 	tupleOffset, flags, size := h.UnpackItemId(v)
 
-	// check if tuple is ok to be marked as deleted
 	switch flags {
-	case ItemIdFlagUnused:
+	case uint8(ItemIdFlagUnused):
 		return fmt.Errorf("tuple already removed")
-
-	case ItemIdDeleted:
+	case uint8(ItemIdFlagDeleted):
 		return fmt.Errorf("tuple already deleted")
-
-	case ItemIdRedirect:
+	case uint8(ItemIdFlagRedirect):
 		return fmt.Errorf("cannot delete redirect slot")
-
-	case ItemIdFlagNormal:
+	case uint8(ItemIdFlagNormal):
 		// ok
 	default:
-		return fmt.Errorf("unknown itemId flag")
+		return fmt.Errorf("unknown itemId flag %d", flags)
 	}
 
-	// 3. Get actual tuple using offset
 	tuple := h.Page[tupleOffset : tupleOffset+size]
 
-	// check old xmax
 	oldXmax := common.ByteOrder.Uint32(
 		tuple[TupleHeaderOffsetXmax : TupleHeaderOffsetXmax+4],
 	)
-
 	if oldXmax != 0 {
-		return fmt.Errorf("Tuple already deleted by txn id %v", oldXmax)
+		return fmt.Errorf("tuple already deleted by txn id %v", oldXmax)
 	}
 
-	// set new xmax and cid
 	common.ByteOrder.PutUint32(
 		tuple[TupleHeaderOffsetXmax:TupleHeaderOffsetXmax+4],
 		uint32(xmax),
@@ -484,81 +463,11 @@ func (h *HeapPage) DeleteTuple(
 		uint32(cid),
 	)
 
-	// 4. Update infomask (future)
-
-	return nil
-}
-
-func (h *HeapPage) NextSlot() (common.SlotIndex, error) {
-	lower := h.GetLower()
-
-	// The slot array grows upward from PageHeaderSize. The slot that the
-	// next insert will claim sits right at the current lower pointer.
-	slotIndex := (lower - page.PageHeaderSize) / ItemIdSize
-
-	// The new slot must not collide with tuple data. If it does, the page
-	// has no room for a new ItemId, let alone the tuple itself.
-	if int(lower)+ItemIdSize > int(h.GetUpper()) {
-		return 0, fmt.Errorf("page has no room for a new slot")
-	}
-
-	return common.SlotIndex(slotIndex), nil
-}
-
-// ReplayRemoveTuple removes the tuple in the given slot during undo of an
-// insert. Unlike DeleteTuple, it doesn't stamp xmax — it physically removes
-// the tuple, since the insert it reverses is being treated as never having
-// happened.
-//
-// The tuple's bytes are left in place; only the ItemId is marked deleted so
-// vacuum can reclaim it. This matches how DeleteTuple works at the page
-// level, just with the reversal semantics applied.
-func (h *HeapPage) ReplayRemoveTuple(slot common.SlotIndex) error {
-	if !h.validateSlot(slot) {
-		return fmt.Errorf("replay remove: invalid slot %d", slot)
-	}
-	slotOffset := getSlotOffset(slot)
-	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
-	_, flags, _ := h.UnpackItemId(v)
-
-	if flags == ItemIdDeleted {
-		return nil // already removed
-	}
-	if flags != ItemIdFlagNormal {
-		return fmt.Errorf("replay remove: slot %d has flags %d (want normal)", slot, flags)
-	}
-
-	// Set the ItemIdDeleted flag while preserving offset and size.
-	deletedV := (v &^ (0b11 << 15)) | (uint32(ItemIdDeleted) << 15)
-	common.ByteOrder.PutUint32(h.Page[slotOffset:slotOffset+ItemIdSize], deletedV)
-	return nil
-}
-
-// ReplayRestoreTuple writes the original tuple bytes back into the given
-// slot, reversing a RecDelete. The before-image contains the tuple's full
-// bytes (header included) as they were before the delete stamped xmax.
-func (h *HeapPage) ReplayRestoreTuple(slot common.SlotIndex, beforeBytes []byte) error {
-	if !h.validateSlot(slot) {
-		return fmt.Errorf("replay restore: invalid slot %d", slot)
-	}
-	slotOffset := getSlotOffset(slot)
-	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
-	tupleOffset, flags, size := h.UnpackItemId(v)
-
-	if flags != ItemIdFlagNormal {
-		return fmt.Errorf("replay restore: slot %d has flags %d (want normal)", slot, flags)
-	}
-	if int(size) != len(beforeBytes) {
-		return fmt.Errorf("replay restore: slot %d size %d != before-image size %d",
-			slot, size, len(beforeBytes))
-	}
-
-	copy(h.Page[tupleOffset:tupleOffset+size], beforeBytes)
 	return nil
 }
 
 // -----------------------------------------------------------------------------
-// Redo/undo replay primitives
+// Replay primitives
 //
 // These methods apply WAL records to the page during recovery. They differ
 // from the runtime write paths (InsertTuple, DeleteTuple) in three ways:
@@ -575,8 +484,7 @@ func (h *HeapPage) ReplayRestoreTuple(slot common.SlotIndex, beforeBytes []byte)
 // ReplayInsert places tupleBytes into slot during redo of a RecInsert record.
 //
 // Idempotent: if the slot already holds exactly these bytes, returns nil.
-// If it holds different bytes, that's corruption (the log says one thing,
-// the page says another) and an error is returned.
+// If it holds different bytes, that's corruption and an error is returned.
 func (h *HeapPage) ReplayInsert(slot common.SlotIndex, tupleBytes []byte) error {
 	if h.DoesTupleInSlotExist(slot) {
 		existing := h.GetTupleWithSlot(slot)
@@ -603,9 +511,6 @@ func (h *HeapPage) ReplayInsert(slot common.SlotIndex, tupleBytes []byte) error 
 //
 // Idempotent: if xmax is already the requested value, returns nil. If xmax
 // is set to a *different* non-zero value, that's corruption.
-//
-// Unlike DeleteTuple, this does not check the caller's txid against the
-// tuple's state — redo applies what the log says regardless.
 func (h *HeapPage) ReplayDelete(slot common.SlotIndex, xmax common.TransactionID) error {
 	if !h.validateSlot(slot) {
 		return fmt.Errorf("replay delete: invalid slot %d", slot)
@@ -614,7 +519,7 @@ func (h *HeapPage) ReplayDelete(slot common.SlotIndex, xmax common.TransactionID
 	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
 	tupleOffset, flags, size := h.UnpackItemId(v)
 
-	if flags != ItemIdFlagNormal {
+	if flags != uint8(ItemIdFlagNormal) {
 		return fmt.Errorf(
 			"replay delete: slot %d has flags %d (want normal)",
 			slot, flags)
@@ -639,5 +544,57 @@ func (h *HeapPage) ReplayDelete(slot common.SlotIndex, xmax common.TransactionID
 	}
 
 	common.ByteOrder.PutUint32(tuple[TupleHeaderOffsetXmax:], uint32(xmax))
+	return nil
+}
+
+// ReplayRemoveTuple removes the tuple in slot during undo of an insert.
+//
+// Undo of an insert means "the tuple was never inserted." The physical
+// bytes stay in the free region (they'll be reclaimed by vacuum or
+// overwritten by a future insert), but the slot is marked ItemIdFlagUnused
+// so it no longer appears to exist.
+//
+// Idempotent: if the slot is already unused or deleted, returns nil.
+func (h *HeapPage) ReplayRemoveTuple(slot common.SlotIndex) error {
+	if !h.validateSlot(slot) {
+		return fmt.Errorf("replay remove: invalid slot %d", slot)
+	}
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	if flags == uint8(ItemIdFlagUnused) || flags == uint8(ItemIdFlagDeleted) {
+		return nil
+	}
+	if flags != uint8(ItemIdFlagNormal) {
+		return fmt.Errorf(
+			"replay remove: slot %d has flags %d (want normal)", slot, flags)
+	}
+
+	newV := packItemId(tupleOffset, uint8(ItemIdFlagUnused), size)
+	common.ByteOrder.PutUint32(h.Page[slotOffset:slotOffset+ItemIdSize], newV)
+	return nil
+}
+
+// ReplayRestoreTuple writes the original tuple bytes back into the given
+// slot, reversing a RecDelete. The before-image contains the tuple's full
+// bytes (header included) as they were before the delete stamped xmax.
+func (h *HeapPage) ReplayRestoreTuple(slot common.SlotIndex, beforeBytes []byte) error {
+	if !h.validateSlot(slot) {
+		return fmt.Errorf("replay restore: invalid slot %d", slot)
+	}
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	if flags != uint8(ItemIdFlagNormal) {
+		return fmt.Errorf("replay restore: slot %d has flags %d (want normal)", slot, flags)
+	}
+	if int(size) != len(beforeBytes) {
+		return fmt.Errorf("replay restore: slot %d size %d != before-image size %d",
+			slot, size, len(beforeBytes))
+	}
+
+	copy(h.Page[tupleOffset:tupleOffset+size], beforeBytes)
 	return nil
 }

@@ -1117,10 +1117,12 @@ func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
 	_ = env.tm.Commit(tx1)
 }
 
-// TestTableHeap_InsertSetsRecLSN verifies that the WAL LSN assigned to an
-// insert propagates to the buffer pool frame's recLSN. This is what makes
-// the checkpoint's dirty page table useful: it points recovery at the
-// earliest WAL record that dirtied the page.
+// TestTableHeap_InsertSetsRecLSN verifies that inserting a tuple causes the
+// frame to be dirtied with the insert's WAL LSN recorded as a candidate
+// recLSN. For a fresh page, the allocation FPW is also recorded (earlier),
+// so recLSN == FPW's LSN — not the insert's — because setRecLSN keeps the
+// minimum. The invariant is: recLSN > 0 (dirty), recLSN <= insert LSN, and
+// the page's pageLSN == insert LSN.
 func TestTableHeap_InsertSetsRecLSN(t *testing.T) {
 	env := setupEnv(t, 2, 8)
 	defer env.Shutdown(t)
@@ -1141,15 +1143,36 @@ func TestTableHeap_InsertSetsRecLSN(t *testing.T) {
 	}
 	defer frame.Unpin()
 
-	// recLSN must equal the insert record's LSN (tx.LastLSN).
-	if got := frame.RecLSN(); got != tx.LastLSN {
-		t.Errorf("recLSN = %v, want %v (insert's WAL LSN)", got, tx.LastLSN)
+	recLSN := frame.RecLSN()
+
+	// 1. The frame must be dirty and must have a recLSN set.
+	if recLSN == 0 {
+		t.Fatal("recLSN is zero — insert did not mark the frame dirty")
+	}
+
+	// 2. recLSN must be at or before the insert's own LSN. For a fresh
+	//    page, recLSN points at the allocation FPW; for a page that was
+	//    already dirty, it points at the earliest prior record. Either way
+	//    it can never be *after* the insert.
+	if recLSN > tx.LastLSN {
+		t.Errorf("recLSN = %v, want <= insert LSN %v", recLSN, tx.LastLSN)
+	}
+
+	// 3. The page's pageLSN tracks the most recent modification, which IS
+	//    the insert. This is what redo compares against for idempotence.
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+	if pageLSN != tx.LastLSN {
+		t.Errorf("pageLSN = %v, want insert LSN %v", pageLSN, tx.LastLSN)
 	}
 }
 
 // TestTableHeap_SecondInsertKeepsFirstRecLSN verifies that a second insert
-// on the same page does not lower the recorded recLSN — the DPT must point
-// at the earliest record that dirtied the page, not the latest.
+// on the same page does not raise the recorded recLSN. The recLSN must
+// point at the earliest record that dirtied the page (for a fresh page,
+// the allocation FPW; for an already-dirty page, the earliest prior
+// record). Later writes on the same page leave it unchanged.
 func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
 	env := setupEnv(t, 1, 8)
 	defer env.Shutdown(t)
@@ -1158,10 +1181,9 @@ func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
 	tx := beginTx(t, env)
 
 	first := insertInt(t, env, tx, schema, 1)
-	firstLSN := tx.LastLSN
 
-	// Second insert lands on the same page (single partition, one frame,
-	// plenty of room).
+	// Capture the recLSN after the first insert and the free space on the
+	// page so we can decide whether a second insert will land there.
 	tag := buffer.BufferTag{
 		RelationID: env.heap.rel,
 		ForkID:     env.heap.fork,
@@ -1171,10 +1193,15 @@ func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	firstRecLSN := frame.RecLSN()
 	frame.RLatch()
 	free := heapFreeSpace(frame.Page)
 	frame.RUnlatch()
 	frame.Unpin()
+
+	if firstRecLSN == 0 {
+		t.Fatalf("recLSN is zero after first insert")
+	}
 
 	if free < 100 {
 		t.Skipf("first page too full to guarantee same-page insert: %d bytes free", free)
@@ -1192,9 +1219,24 @@ func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
 	}
 	defer frame.Unpin()
 
-	if got := frame.RecLSN(); got != firstLSN {
-		t.Errorf("recLSN after 2 inserts = %v, want %v (first insert's LSN)",
-			got, firstLSN)
+	// Invariant 1: recLSN is unchanged. The second insert cannot raise the
+	// minimum, because the page was already dirty from the first insert
+	// (and the allocation FPW before it).
+	if got := frame.RecLSN(); got != firstRecLSN {
+		t.Errorf("recLSN after 2 inserts = %v, want %v (unchanged by second insert)",
+			got, firstRecLSN)
+	}
+
+	// Invariant 2: pageLSN advanced to the second insert's LSN. This
+	// confirms the second insert actually wrote to the page and that
+	// pageLSN tracks "the most recent modification," which is a different
+	// concept from recLSN.
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+	if pageLSN != tx.LastLSN {
+		t.Errorf("pageLSN = %v, want second insert's LSN %v",
+			pageLSN, tx.LastLSN)
 	}
 }
 
