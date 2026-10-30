@@ -34,6 +34,7 @@ type TableHeap struct {
 	rel      common.RelationID
 	fork     common.ForkID
 	tm       *transaction.TransactionManager
+	wal      *wal.WAL // for system records: page-allocation FPWs
 	extendMu sync.Mutex
 }
 
@@ -42,6 +43,7 @@ func NewTableHeap(
 	fsm *FSM,
 	rel common.RelationID,
 	tm *transaction.TransactionManager,
+	w *wal.WAL,
 ) *TableHeap {
 	return &TableHeap{
 		bp:   bp,
@@ -49,6 +51,7 @@ func NewTableHeap(
 		rel:  rel,
 		fork: common.ForkMain,
 		tm:   tm,
+		wal:  w,
 	}
 }
 
@@ -119,9 +122,45 @@ func (th *TableHeap) getPageForInsert(
 			fmt.Errorf("failed to allocate page in buffer pool: %w", err)
 	}
 
+	// Initialize the page in memory and encode the full-page image under
+	// the latch, so the logged bytes exactly match what will be persisted.
 	frame.WLatch()
 	heap.InitHeapPage(frame.Page)
+	fpwPayload := wal.EncodeFPW(th.rel, th.fork, targetBlockID, frame.Page)
 	frame.WUnlatch()
+
+	// Log the full-page image as a system record (TxID 0).
+	//
+	// Without this, a crash between AllocatePage and the first insert
+	// leaves the page on disk as zeros with no WAL record describing its
+	// intended state. Recovery would have no way to reconstruct it, and
+	// the next insert targeting this block would read garbage.
+	//
+	// RecFPW with FlagHasAfter is the standard way to say "the
+	// authoritative state of this page is these bytes." Redo overwrites
+	// the whole page from the payload, which also handles the torn-page
+	// case if the page was partially written before the crash.
+	fpwLSN, err := th.wal.Append(&wal.Record{
+		TxID:  0,
+		Type:  wal.RecFPW,
+		Flags: wal.FlagHasAfter,
+		Data:  fpwPayload,
+	})
+	if err != nil {
+		th.extendMu.Unlock()
+		frame.Unpin()
+		return common.InvalidBlockID, nil,
+			fmt.Errorf("wal fpw on allocation: %w", err)
+	}
+
+	// Record the FPW's LSN on the page and in the frame's recLSN. This is
+	// what makes the newly allocated page participate in the dirty page
+	// table from the moment of creation — a checkpoint that fires between
+	// now and the first insert will include this page in its redo set.
+	frame.WLatch()
+	frame.Page.SetLSN(fpwLSN)
+	frame.WUnlatch()
+	th.bp.MarkDirtyWithLSN(frame, fpwLSN)
 
 	th.extendMu.Unlock()
 	return targetBlockID, frame, nil

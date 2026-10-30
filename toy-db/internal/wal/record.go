@@ -150,20 +150,6 @@ func PeekRecordLen(buf []byte) (uint32, error) {
 // Payload codecs (add per record type as you go)
 // -----------------------------------------------------------------------------
 
-func EncodeFPW(pageID uint64, page []byte) []byte {
-	out := make([]byte, 8+len(page))
-	common.ByteOrder.PutUint64(out[0:], pageID)
-	copy(out[8:], page)
-	return out
-}
-
-func DecodeFPW(b []byte) (pageID uint64, page []byte, err error) {
-	if len(b) < 8 {
-		return 0, nil, ErrCorrupt
-	}
-	return common.ByteOrder.Uint64(b[0:]), b[8:], nil
-}
-
 // EncodeInsert builds the payload for a RecInsert record.
 //
 // Layout:
@@ -269,4 +255,38 @@ func DecodeUpdate(b []byte) (common.RowId, []byte, []byte, error) {
 	before := b[22 : 22+beforeLen]
 	after := b[22+beforeLen : 22+beforeLen+afterLen]
 	return row, before, after, nil
+}
+
+// EncodeFPW builds the payload for a RecFPW (full-page write) record.
+//
+// Layout:
+//
+//	rel(4) | fork(2) | blockID(8) | pageBytes
+//
+// The relation and fork are included so redo can construct the full
+// BufferTag and locate the page. An earlier version carried only blockID,
+// which was sufficient to *name* a page but not to fetch it.
+func EncodeFPW(
+	rel common.RelationID,
+	fork common.ForkID,
+	blockID common.BlockID,
+	pageBytes []byte,
+) []byte {
+	buf := make([]byte, 14+len(pageBytes))
+	common.ByteOrder.PutUint32(buf[0:], uint32(rel))
+	common.ByteOrder.PutUint16(buf[4:], uint16(fork))
+	common.ByteOrder.PutUint64(buf[6:], uint64(blockID))
+	copy(buf[14:], pageBytes)
+	return buf
+}
+
+// DecodeFPW parses a RecFPW payload. The returned page slice aliases b.
+func DecodeFPW(b []byte) (common.RelationID, common.ForkID, common.BlockID, []byte, error) {
+	if len(b) < 14 {
+		return 0, 0, 0, nil, ErrCorrupt
+	}
+	rel := common.RelationID(common.ByteOrder.Uint32(b[0:]))
+	fork := common.ForkID(common.ByteOrder.Uint16(b[4:]))
+	blockID := common.BlockID(common.ByteOrder.Uint64(b[6:]))
+	return rel, fork, blockID, b[14:], nil
 }

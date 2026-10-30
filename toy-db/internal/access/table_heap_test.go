@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -87,7 +88,9 @@ func setupEnv(t *testing.T, partitions common.PartitionIndex, framesPerPartition
 	tm := transaction.NewManager(w, c)
 
 	rel := common.RelationID(1)
-	th := NewTableHeap(bp, NewFSM(bp), rel, tm)
+	// 5th argument: the WAL handle. TableHeap needs it for the
+	// page-allocation FPW record written by getPageForInsert.
+	th := NewTableHeap(bp, NewFSM(bp), rel, tm, w)
 
 	return &testEnv{
 		heap:   th,
@@ -1201,4 +1204,121 @@ func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
 func heapFreeSpace(p page.Page) int {
 	hp := &heap.HeapPage{Page: p}
 	return hp.GetFreeSpace()
+}
+
+// -----------------------------------------------------------------------------
+// Page allocation FPW
+// -----------------------------------------------------------------------------
+
+// TestAllocatePageLogsFPW verifies that extending the relation logs a
+// RecFPW record containing the freshly initialized page, so recovery can
+// reconstruct the page if it never reaches disk.
+func TestAllocatePageLogsFPW(t *testing.T) {
+	env := setupEnv(t, 1, 4)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	// First insert forces a page allocation.
+	rid := insertInt(t, env, tx, schema, 42)
+
+	// Flush the WAL so the FPW record is visible.
+	if err := env.wal.FlushUpTo(tx.LastLSN); err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := env.wal.IterateFrom(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+
+	var found bool
+	for {
+		rec, err := it.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("iterate: %v", err)
+		}
+		if rec.Type != wal.RecFPW {
+			continue
+		}
+		rel, fork, blockID, pageBytes, derr := wal.DecodeFPW(rec.Data)
+		if derr != nil {
+			t.Fatalf("DecodeFPW: %v", derr)
+		}
+		if rel != env.heap.rel || fork != env.heap.fork || blockID != rid.BlockID {
+			continue
+		}
+		found = true
+
+		// FPW must be a system record (TxID 0), with an after-image only.
+		if rec.TxID != 0 {
+			t.Errorf("FPW TxID: got %d want 0 (system record)", rec.TxID)
+		}
+		if rec.Flags&wal.FlagHasAfter == 0 {
+			t.Errorf("FPW missing FlagHasAfter")
+		}
+		if rec.Flags&wal.FlagHasBefore != 0 {
+			t.Errorf("FPW should not carry a before-image")
+		}
+		if len(pageBytes) != int(common.PageSize) {
+			t.Errorf("FPW page size: got %d want %d", len(pageBytes), common.PageSize)
+		}
+
+		// The logged page must be a properly initialized heap page.
+		hp := &heap.HeapPage{Page: page.Page(pageBytes)}
+		if hp.GetLower() != page.PageHeaderSize {
+			t.Errorf("logged page lower: got %d want %d",
+				hp.GetLower(), page.PageHeaderSize)
+		}
+		if hp.GetUpper() != uint16(common.PageSize) {
+			t.Errorf("logged page upper: got %d want %d",
+				hp.GetUpper(), common.PageSize)
+		}
+		break
+	}
+
+	if !found {
+		t.Fatal("no RecFPW found for allocated block")
+	}
+}
+
+// TestAllocatePageFPWSetsRecLSN verifies that the buffer pool frame for a
+// freshly allocated page records the FPW's LSN in its recLSN, so the frame
+// participates in the dirty page table from the moment of allocation.
+func TestAllocatePageFPWSetsRecLSN(t *testing.T) {
+	env := setupEnv(t, 1, 4)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+	rid := insertInt(t, env, tx, schema, 1)
+
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    rid.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	// recLSN should be nonzero — the FPW's LSN.
+	if got := frame.RecLSN(); got == 0 {
+		t.Fatal("recLSN is zero after allocation; FPW was not logged")
+	}
+
+	// pageLSN >= recLSN (the insert record advances pageLSN past the FPW).
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+	if pageLSN < frame.RecLSN() {
+		t.Errorf("pageLSN (%v) < recLSN (%v)", pageLSN, frame.RecLSN())
+	}
 }

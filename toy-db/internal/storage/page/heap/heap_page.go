@@ -1,6 +1,7 @@
 package heap
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
@@ -114,6 +115,13 @@ func (h *HeapPage) GetFreeSpace() int {
 	return int(h.GetUpper() - h.GetLower())
 }
 
+// NextSlotIdx returns the slot index that the next InstallTuple would
+// allocate. It is the same computation as NextSlot but without the
+// room check — callers that need the check should use NextSlot instead.
+func (h *HeapPage) NextSlotIdx() common.SlotIndex {
+	return common.SlotIndex((h.GetLower() - page.PageHeaderSize) / ItemIdSize)
+}
+
 func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint16) {
 	// top 15 bits
 	offset = uint16(v >> 17)
@@ -127,6 +135,24 @@ func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint
 	size = uint16(v & fifteenBitMask)
 
 	return offset, flags, size
+}
+
+// UnpackItemId decodes the 4-byte ItemId slot entry into (offset, flags, size).
+//
+// Layout (8 KB pages):
+//
+//	bits 0–12    size    (13 bits, max 8191)
+//	bits 13–18   flags   (6 bits, values 0–63)
+//	bits 19–31   offset  (13 bits, max 8191)
+//
+// The offset field is exactly wide enough for any byte position in an 8 KB
+// page. The size field is 13 bits; the largest tuple that fits is 8191
+// bytes, well above any practical tuple given the fixed header overhead.
+func (h *HeapPage) UnpackItemId(v uint32) (offset uint16, flags uint8, size uint16) {
+	offset = uint16(v >> 19)
+	flags = uint8((v >> 13) & 0b111111) // 6-bit mask
+	size = uint16(v & 0b1111111111111)  // 13-bit mask
+	return
 }
 
 // get the slot index, based on slot position.
@@ -477,4 +503,141 @@ func (h *HeapPage) NextSlot() (common.SlotIndex, error) {
 	}
 
 	return common.SlotIndex(slotIndex), nil
+}
+
+// ReplayRemoveTuple removes the tuple in the given slot during undo of an
+// insert. Unlike DeleteTuple, it doesn't stamp xmax — it physically removes
+// the tuple, since the insert it reverses is being treated as never having
+// happened.
+//
+// The tuple's bytes are left in place; only the ItemId is marked deleted so
+// vacuum can reclaim it. This matches how DeleteTuple works at the page
+// level, just with the reversal semantics applied.
+func (h *HeapPage) ReplayRemoveTuple(slot common.SlotIndex) error {
+	if !h.validateSlot(slot) {
+		return fmt.Errorf("replay remove: invalid slot %d", slot)
+	}
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	_, flags, _ := h.UnpackItemId(v)
+
+	if flags == ItemIdDeleted {
+		return nil // already removed
+	}
+	if flags != ItemIdFlagNormal {
+		return fmt.Errorf("replay remove: slot %d has flags %d (want normal)", slot, flags)
+	}
+
+	// Set the ItemIdDeleted flag while preserving offset and size.
+	deletedV := (v &^ (0b11 << 15)) | (uint32(ItemIdDeleted) << 15)
+	common.ByteOrder.PutUint32(h.Page[slotOffset:slotOffset+ItemIdSize], deletedV)
+	return nil
+}
+
+// ReplayRestoreTuple writes the original tuple bytes back into the given
+// slot, reversing a RecDelete. The before-image contains the tuple's full
+// bytes (header included) as they were before the delete stamped xmax.
+func (h *HeapPage) ReplayRestoreTuple(slot common.SlotIndex, beforeBytes []byte) error {
+	if !h.validateSlot(slot) {
+		return fmt.Errorf("replay restore: invalid slot %d", slot)
+	}
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	if flags != ItemIdFlagNormal {
+		return fmt.Errorf("replay restore: slot %d has flags %d (want normal)", slot, flags)
+	}
+	if int(size) != len(beforeBytes) {
+		return fmt.Errorf("replay restore: slot %d size %d != before-image size %d",
+			slot, size, len(beforeBytes))
+	}
+
+	copy(h.Page[tupleOffset:tupleOffset+size], beforeBytes)
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Redo/undo replay primitives
+//
+// These methods apply WAL records to the page during recovery. They differ
+// from the runtime write paths (InsertTuple, DeleteTuple) in three ways:
+//
+//   1. No WAL logging — the WAL record already exists; replay just applies it.
+//   2. No conflict checks — no user transaction is running during recovery.
+//   3. Idempotent — replaying the same record twice produces the same state.
+//
+// The idempotence check (pageLSN < rec.LSN) is done by the caller
+// (replayWithPage in access/heap_applier.go). These methods assume the
+// caller has already decided the change needs to be applied.
+// -----------------------------------------------------------------------------
+
+// ReplayInsert places tupleBytes into slot during redo of a RecInsert record.
+//
+// Idempotent: if the slot already holds exactly these bytes, returns nil.
+// If it holds different bytes, that's corruption (the log says one thing,
+// the page says another) and an error is returned.
+func (h *HeapPage) ReplayInsert(slot common.SlotIndex, tupleBytes []byte) error {
+	if h.DoesTupleInSlotExist(slot) {
+		existing := h.GetTupleWithSlot(slot)
+		if bytes.Equal(existing, tupleBytes) {
+			return nil
+		}
+		return fmt.Errorf(
+			"replay insert: slot %d already holds %d bytes, want %d",
+			slot, len(existing), len(tupleBytes))
+	}
+
+	if slot != h.NextSlotIdx() {
+		return fmt.Errorf(
+			"replay insert: slot %d is not the next free slot %d",
+			slot, h.NextSlotIdx())
+	}
+
+	_, err := h.InstallTuple(slot, tupleBytes)
+	return err
+}
+
+// ReplayDelete stamps xmax on the tuple in slot during redo of a RecDelete
+// record.
+//
+// Idempotent: if xmax is already the requested value, returns nil. If xmax
+// is set to a *different* non-zero value, that's corruption.
+//
+// Unlike DeleteTuple, this does not check the caller's txid against the
+// tuple's state — redo applies what the log says regardless.
+func (h *HeapPage) ReplayDelete(slot common.SlotIndex, xmax common.TransactionID) error {
+	if !h.validateSlot(slot) {
+		return fmt.Errorf("replay delete: invalid slot %d", slot)
+	}
+	slotOffset := getSlotOffset(slot)
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	if flags != ItemIdFlagNormal {
+		return fmt.Errorf(
+			"replay delete: slot %d has flags %d (want normal)",
+			slot, flags)
+	}
+	if int(size) < HeapTupleHeaderMinSize {
+		return fmt.Errorf(
+			"replay delete: tuple in slot %d too small for header (%d bytes)",
+			slot, size)
+	}
+
+	tuple := h.Page[tupleOffset : tupleOffset+size]
+	oldXmax := common.TransactionID(
+		common.ByteOrder.Uint32(tuple[TupleHeaderOffsetXmax:]))
+
+	if oldXmax == xmax {
+		return nil // already applied
+	}
+	if oldXmax != 0 {
+		return fmt.Errorf(
+			"replay delete: slot %d already deleted by tx %d (want %d)",
+			slot, oldXmax, xmax)
+	}
+
+	common.ByteOrder.PutUint32(tuple[TupleHeaderOffsetXmax:], uint32(xmax))
+	return nil
 }

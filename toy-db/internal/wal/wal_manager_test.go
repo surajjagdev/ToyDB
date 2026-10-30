@@ -927,11 +927,20 @@ func TestWALTruncateBeforeKeepsActiveSegment(t *testing.T) {
 	}
 	defer w.Close()
 
+	// Append enough records to force at least one rotation.
+	var lastLSN LSN
 	for i := 0; i < 20; i++ {
 		rec := Record{Type: RecInsert, Data: bytes.Repeat([]byte{0xAB}, 100)}
-		w.Append(&rec)
+		lsn, err := w.Append(&rec)
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		lastLSN = lsn
 	}
-	if err := w.Sync(context.Background(), w.LastLSN()); err != nil {
+
+	// Sync to the last record's own LSN — not to LastLSN(), which
+	// points one past the end of the write buffer and would hang.
+	if err := w.Sync(context.Background(), lastLSN); err != nil {
 		t.Fatal(err)
 	}
 
@@ -940,7 +949,10 @@ func TestWALTruncateBeforeKeepsActiveSegment(t *testing.T) {
 		t.Skipf("need 2+ segments, got %d", len(segs))
 	}
 
-	currentSeg := w.LastLSN().GetSegmentNumber()
+	// The active segment is the one the last record went into. Read it
+	// from the record's LSN rather than from LastLSN() (which may have
+	// advanced past this segment if a flush raced us).
+	currentSeg := lastLSN.GetSegmentNumber()
 
 	// Truncate before the current segment. Everything older goes; the
 	// active segment must survive.
@@ -973,10 +985,12 @@ func TestWALTruncateBeforeTargetBeyondCurrent(t *testing.T) {
 
 	// One record establishes the current segment.
 	rec := Record{Type: RecInsert, Data: []byte("x")}
-	if _, err := w.Append(&rec); err != nil {
+	lsn, err := w.Append(&rec)
+
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Sync(context.Background(), w.LastLSN()); err != nil {
+	if err := w.Sync(context.Background(), lsn); err != nil {
 		t.Fatal(err)
 	}
 
