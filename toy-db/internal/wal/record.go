@@ -290,3 +290,126 @@ func DecodeFPW(b []byte) (common.RelationID, common.ForkID, common.BlockID, []by
 	blockID := common.BlockID(common.ByteOrder.Uint64(b[6:]))
 	return rel, fork, blockID, b[14:], nil
 }
+
+// -----------------------------------------------------------------------------
+// RecCheckpoint payload
+// -----------------------------------------------------------------------------
+
+// CheckpointDirtyPage is one row of the dirty page table embedded in a
+// checkpoint record. The slot field of RowId is always zero — dirty page
+// tracking is at page granularity, not tuple granularity.
+type CheckpointDirtyPage struct {
+	Row    common.RowId
+	RecLSN LSN
+}
+
+// CheckpointPayload is the payload of a RecCheckpoint record. It is what
+// recovery reads at startup to seed the transaction table and dirty page
+// table before scanning forward from RedoLSN.
+type CheckpointPayload struct {
+	// RedoLSN is where recovery must begin scanning the WAL. It equals
+	// min(DirtyPages[i].RecLSN), or the checkpoint record's own LSN if the
+	// dirty page table is empty.
+	RedoLSN LSN
+
+	// ActiveTxIDs is the set of transactions running at checkpoint time.
+	// Recovery seeds its transaction table with these as "active" before
+	// scanning forward. Any that committed or aborted afterward will be
+	// resolved by the scan.
+	ActiveTxIDs []common.TransactionID
+
+	// DirtyPages is the set of pages with unflushed changes at checkpoint
+	// time, along with the earliest LSN that dirtied each.
+	DirtyPages []CheckpointDirtyPage
+}
+
+// EncodeCheckpoint builds the payload for a RecCheckpoint record.
+//
+// Layout:
+//
+//	redoLSN(8)
+//	| txCount(4) | tx_0(4) ... tx_n(4)
+//	| pgCount(4)
+//	| page_0{rel(4), block(8), slot(2), recLSN(8)} ...
+func EncodeCheckpoint(cp CheckpointPayload) []byte {
+	size := 8 + 4 + 4*len(cp.ActiveTxIDs) + 4 + 22*len(cp.DirtyPages)
+	buf := make([]byte, size)
+
+	off := 0
+	common.ByteOrder.PutUint64(buf[off:], uint64(cp.RedoLSN))
+	off += 8
+
+	common.ByteOrder.PutUint32(buf[off:], uint32(len(cp.ActiveTxIDs)))
+	off += 4
+	for _, id := range cp.ActiveTxIDs {
+		common.ByteOrder.PutUint32(buf[off:], uint32(id))
+		off += 4
+	}
+
+	common.ByteOrder.PutUint32(buf[off:], uint32(len(cp.DirtyPages)))
+	off += 4
+	for _, p := range cp.DirtyPages {
+		common.ByteOrder.PutUint32(buf[off:], uint32(p.Row.RelationID))
+		common.ByteOrder.PutUint64(buf[off+4:], uint64(p.Row.BlockID))
+		common.ByteOrder.PutUint16(buf[off+12:], uint16(p.Row.Slot))
+		common.ByteOrder.PutUint64(buf[off+14:], uint64(p.RecLSN))
+		off += 22
+	}
+
+	return buf
+}
+
+// DecodeCheckpoint parses a RecCheckpoint payload.
+//
+// Returns ErrCorrupt if the buffer is malformed (too short, or a count that
+// would require more bytes than the buffer holds). The returned slices
+// alias b — the caller should copy them if they outlive the record.
+func DecodeCheckpoint(b []byte) (CheckpointPayload, error) {
+	var cp CheckpointPayload
+
+	if len(b) < 12 {
+		return cp, ErrCorrupt
+	}
+
+	off := 0
+	cp.RedoLSN = LSN(common.ByteOrder.Uint64(b[off:]))
+	off += 8
+
+	txCount := int(common.ByteOrder.Uint32(b[off:]))
+	off += 4
+	if txCount < 0 || off+4*txCount > len(b) {
+		return cp, ErrCorrupt
+	}
+	if txCount > 0 {
+		cp.ActiveTxIDs = make([]common.TransactionID, txCount)
+		for i := 0; i < txCount; i++ {
+			cp.ActiveTxIDs[i] = common.TransactionID(common.ByteOrder.Uint32(b[off:]))
+			off += 4
+		}
+	}
+
+	if off+4 > len(b) {
+		return cp, ErrCorrupt
+	}
+	pgCount := int(common.ByteOrder.Uint32(b[off:]))
+	off += 4
+	if pgCount < 0 || off+22*pgCount > len(b) {
+		return cp, ErrCorrupt
+	}
+	if pgCount > 0 {
+		cp.DirtyPages = make([]CheckpointDirtyPage, pgCount)
+		for i := 0; i < pgCount; i++ {
+			cp.DirtyPages[i] = CheckpointDirtyPage{
+				Row: common.RowId{
+					RelationID: common.RelationID(common.ByteOrder.Uint32(b[off:])),
+					BlockID:    common.BlockID(common.ByteOrder.Uint64(b[off+4:])),
+					Slot:       common.SlotIndex(common.ByteOrder.Uint16(b[off+12:])),
+				},
+				RecLSN: LSN(common.ByteOrder.Uint64(b[off+14:])),
+			}
+			off += 22
+		}
+	}
+
+	return cp, nil
+}

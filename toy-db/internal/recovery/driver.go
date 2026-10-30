@@ -1,11 +1,14 @@
 package recovery
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/surajjagdev/ToyDB/internal/clog"
 	"github.com/surajjagdev/ToyDB/internal/common"
+	"github.com/surajjagdev/ToyDB/internal/control"
+	"github.com/surajjagdev/ToyDB/internal/storage/disk"
 	"github.com/surajjagdev/ToyDB/internal/transaction"
 	"github.com/surajjagdev/ToyDB/internal/wal"
 )
@@ -29,19 +32,27 @@ type Deps struct {
 // Options tunes recovery. Currently only diagnostics; future versions will
 // accept checkpoint-related knobs.
 type Options struct {
-	// LogProgress, if true, prints to stdout at the start and end of each
-	// phase. Useful in crash tests and demos.
 	LogProgress bool
+
+	// ControlDir, if non-empty, enables checkpoint-based recovery. The
+	// driver reads the master record from this directory to find the last
+	// checkpoint. If empty (or the file is missing/corrupt), recovery
+	// falls back to a full scan.
+	ControlDir string
+
+	// VFD is used for control file I/O. Required if ControlDir is set.
+	VFD *disk.VFDCache
 }
 
 // RecoveryResult bundles the outcome of a recovery run.
 type RecoveryResult struct {
-	Analysis    *AnalysisResult
-	RedoStats   RedoStats
-	UndoStats   UndoStats
-	CLOGUpdates int
-	NextTxID    common.TransactionID
-	Duration    time.Duration
+	Analysis       *AnalysisResult
+	RedoStats      RedoStats
+	UndoStats      UndoStats
+	CLOGUpdates    int
+	NextTxID       common.TransactionID
+	Duration       time.Duration
+	UsedCheckpoint bool
 }
 
 // Recover runs the full three-pass recovery algorithm and returns the
@@ -66,113 +77,105 @@ func Recover(deps Deps, opts Options) (*RecoveryResult, error) {
 
 	res := &RecoveryResult{}
 
-	// --- 1. Analyze -------------------------------------------------------
-	if opts.LogProgress {
-		fmt.Println("[recovery] analyze: scanning WAL")
+	// Try to locate a checkpoint via the master record.
+	var (
+		startLSN          wal.LSN
+		initialTxTable    map[common.TransactionID]*TxEntry
+		initialDirtyPages []DirtyPageEntry
+	)
+
+	if opts.ControlDir != "" && opts.VFD != nil {
+		ctrl, err := control.Read(opts.VFD, opts.ControlDir)
+		switch {
+		case err == nil:
+			cpRec, rerr := deps.WAL.ReadAt(ctrl.CheckpointLSN)
+			if rerr == nil && cpRec.Type == wal.RecCheckpoint {
+				decoded, derr := wal.DecodeCheckpoint(cpRec.Data)
+				if derr == nil {
+					res.UsedCheckpoint = true
+					startLSN = decoded.RedoLSN
+
+					initialTxTable = make(map[common.TransactionID]*TxEntry, len(decoded.ActiveTxIDs))
+					for _, txid := range decoded.ActiveTxIDs {
+						initialTxTable[txid] = &TxEntry{
+							TxId:   txid,
+							Status: TxActive,
+						}
+					}
+					for _, dp := range decoded.DirtyPages {
+						initialDirtyPages = append(initialDirtyPages, DirtyPageEntry{
+							Row:    dp.Row,
+							RecLSN: dp.RecLSN,
+						})
+					}
+					if opts.LogProgress {
+						fmt.Printf("[recovery] checkpoint at %v, redo from %v\n",
+							ctrl.CheckpointLSN, decoded.RedoLSN)
+					}
+				}
+			}
+		case errors.Is(err, control.ErrNotFound):
+			// Fresh DB. Full scan.
+		case errors.Is(err, control.ErrCorrupt):
+			if opts.LogProgress {
+				fmt.Printf("[recovery] control corrupt, full scan: %v\n", err)
+			}
+		default:
+			return nil, fmt.Errorf("recovery: control read: %w", err)
+		}
 	}
-	analysis, err := Analyze(deps.WAL, 0, nil, nil)
+
+	// --- 1. Analyze ---
+	analysis, err := Analyze(deps.WAL, startLSN, initialTxTable, initialDirtyPages)
 	if err != nil {
 		return nil, fmt.Errorf("recovery: analyze: %w", err)
 	}
 	res.Analysis = analysis
 
-	if opts.LogProgress {
-		fmt.Printf("[recovery] analyze: %d txns (%d committed, %d aborted, %d losers), %d dirty pages, redo from %v\n",
-			len(analysis.TxTable),
-			analysis.CommittedCount(),
-			analysis.AbortedCount(),
-			len(analysis.Losers),
-			analysis.DirtyPages.Len(),
-			analysis.RedoStart,
-		)
-	}
-
-	// --- 2. Redo ----------------------------------------------------------
-	if opts.LogProgress {
-		fmt.Println("[recovery] redo: replaying changes")
-	}
+	// --- 2. Redo ---
 	redoStats, err := Redo(deps.WAL, analysis, deps.Apply)
 	if err != nil {
 		return nil, fmt.Errorf("recovery: redo: %w", err)
 	}
 	res.RedoStats = redoStats
 
-	if opts.LogProgress {
-		fmt.Printf("[recovery] redo: %d records scanned, %d applied\n",
-			redoStats.RecordsScanned, redoStats.RecordsApplied)
-	}
-
-	// --- 3. Undo ----------------------------------------------------------
-	if opts.LogProgress {
-		fmt.Printf("[recovery] undo: rolling back %d losers\n", len(analysis.Losers))
-	}
+	// --- 3. Undo ---
 	undoStats, err := Undo(deps.WAL, analysis, deps.Apply)
 	if err != nil {
 		return nil, fmt.Errorf("recovery: undo: %w", err)
 	}
 	res.UndoStats = undoStats
 
-	if opts.LogProgress {
-		fmt.Printf("[recovery] undo: %d losers, %d records undone, %d CLRs\n",
-			undoStats.Losers, undoStats.RecordsUndone, undoStats.CLRsWritten)
-	}
-
-	// --- 4. Populate CLOG -------------------------------------------------
-	//
-	// Every transaction in the analysis result has a final state now:
-	//   - TxCommitted   → CLOG Committed
-	//   - TxAborted     → CLOG Aborted (was aborted before the crash)
-	//   - TxActive      → CLOG Aborted (we just undid it above)
-	//
-	// We call TM.RecordState for each so the CLOG is complete. This is the
-	// durability contract for IsCommitted: after Recover returns, every xid
-	// that ever existed has an answer in CLOG.
+	// --- 4. Populate CLOG ---
 	for txid, entry := range analysis.TxTable {
 		var state transaction.State
 		switch entry.Status {
 		case TxCommited:
 			state = transaction.Committed
 		case TxAborted, TxActive:
-			// TxActive losers were just aborted by the Undo pass.
 			state = transaction.Aborted
 		default:
-			return nil, fmt.Errorf(
-				"recovery: unexpected tx state %v for tx %d", entry.Status, txid)
+			return nil, fmt.Errorf("recovery: unexpected tx state %v for tx %d", entry.Status, txid)
 		}
 		if err := deps.TM.RecordState(txid, state); err != nil {
-			return nil, fmt.Errorf(
-				"recovery: CLOG update for tx %d: %w", txid, err)
+			return nil, fmt.Errorf("recovery: CLOG update for tx %d: %w", txid, err)
 		}
 		res.CLOGUpdates++
 	}
 
-	// --- 5. Reset transaction manager -------------------------------------
-	//
-	// The TM's active map must be empty (no client traffic yet) and
-	// nextTxID must be past any ID we saw, so new transactions don't
-	// collide with existing tuples' xmin/xmax.
+	// --- 5. Reset TM ---
 	nextTxID := analysis.MaxTxID + 1
-	if nextTxID < 3 { // 0=Invalid, 1=Bootstrap, 2=Frozen
+	if nextTxID < 3 {
 		nextTxID = 3
 	}
 	deps.TM.ResetForRecovery(nextTxID)
 	res.NextTxID = nextTxID
 
-	// --- 6. Flush CLOG ----------------------------------------------------
-	//
-	// Make CLOG durable before accepting traffic. If we crash between here
-	// and the first client query, the next recovery rebuilds CLOG from the
-	// WAL — so this flush isn't strictly necessary for correctness, but it
-	// bounds the re-scan work on repeated crashes.
+	// --- 6. Flush CLOG ---
 	if err := deps.CLOG.Flush(); err != nil {
 		return nil, fmt.Errorf("recovery: CLOG flush: %w", err)
 	}
 
 	res.Duration = time.Since(start)
-	if opts.LogProgress {
-		fmt.Printf("[recovery] complete in %v (next txid %d)\n",
-			res.Duration, res.NextTxID)
-	}
-
 	return res, nil
 }
