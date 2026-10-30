@@ -243,3 +243,60 @@ func (v *VFDCache) Release(e *VfdEntry) {
 
 	e.refCount--
 }
+
+// Rename atomically renames oldPath to newPath.
+//
+// Both paths must be in VFD-managed directories. Any open entries for
+// either path are invalidated: the VFD will close and reopen them on next
+// access.
+func (v *VFDCache) Rename(oldPath, newPath string) error {
+	v.mu.Lock()
+	// Close and evict any open entries for oldPath or newPath.
+	for fn, entry := range v.cache {
+		if fn.Path == oldPath || fn.Path == newPath {
+			entry.closeFile()
+			v.lruList.Remove(entry.elem)
+			entry.elem = nil
+			delete(v.cache, fn)
+		}
+	}
+	v.mu.Unlock()
+
+	return os.Rename(oldPath, newPath)
+}
+
+// SyncDir fsyncs a directory so that renames and creations within it are
+// durable. The path itself is not opened through the VFD — directories are
+// not files and don't participate in fd caching.
+func (v *VFDCache) SyncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// RemoveUnlinked removes a file by path, closing any open entries.
+// This is what Unlink should be if it isn't already implemented that way.
+func (v *VFDCache) RemoveUnlinked(path string) error {
+	v.mu.Lock()
+	for fn, entry := range v.cache {
+		if fn.Path == path {
+			entry.closeFile()
+			v.lruList.Remove(entry.elem)
+			entry.elem = nil
+			delete(v.cache, fn)
+		}
+	}
+	v.mu.Unlock()
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
