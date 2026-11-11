@@ -39,16 +39,20 @@ type TransactionID uint32
 // Defined in: internal/common/types.go
 type CommandID uint32
 
-// Log seq number is u64 (8 bytes).
-// Defined in: internal/common/types.go
-type LogSeqNumber uint64
-
 type FrameIndex uint32
 type PartitionIndex uint32
 
 type SlotIndex uint16
 
+// inside the context, already knows the relationship - so we keep rowid and recordid separate
 type RecordId struct {
-	BlockID BlockID
+	BlockID BlockID //
 	Slot    SlotIndex
+}
+
+// uniquely identifies a tuple
+type RowId struct {
+	RelationID RelationID // identifies the table
+	BlockID    BlockID    // identifies the page
+	Slot       SlotIndex  // identifies tuple slot in page
 }

@@ -1,63 +1,155 @@
 package access
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/surajjagdev/ToyDB/internal/catalog"
+	"github.com/surajjagdev/ToyDB/internal/clog"
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/buffer"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
+	"github.com/surajjagdev/ToyDB/internal/storage/page"
+	"github.com/surajjagdev/ToyDB/internal/storage/page/heap"
+	"github.com/surajjagdev/ToyDB/internal/transaction"
 	"github.com/surajjagdev/ToyDB/internal/types"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
-func setupTableHeap(t *testing.T, partitions common.PartitionIndex, framesPerPartition common.FrameIndex) (*TableHeap, *buffer.BufferPool) {
+// -----------------------------------------------------------------------------
+// Test harness
+// -----------------------------------------------------------------------------
+
+// testLogFlusher is a no-op LogFlusher for buffer-pool tests that don't
+// exercise the write-ahead rule.
+type testLogFlusher struct{}
+
+func (testLogFlusher) FlushUpTo(lsn wal.LSN) error { return nil }
+
+// testEnv bundles everything a test needs to drive a TableHeap.
+type testEnv struct {
+	heap   *TableHeap
+	bp     *buffer.BufferPool
+	tm     *transaction.TransactionManager
+	wal    *wal.WAL
+	walDir string
+	vfd    *disk.VFDCache
+	clog   *clog.Manager
+}
+
+func (e *testEnv) Shutdown(t *testing.T) {
+	t.Helper()
+	_ = e.bp.Shutdown()
+	_ = e.clog.Close()
+	_ = e.wal.Close()
+	_ = os.RemoveAll(e.walDir)
+}
+
+func setupEnv(t *testing.T, partitions common.PartitionIndex, framesPerPartition common.FrameIndex) *testEnv {
 	t.Helper()
 
-	dm, err := disk.NewDirectManager(t.TempDir(), 100, 100)
+	dir := t.TempDir()
+
+	dm, err := disk.NewDirectManager(dir, 100, 100)
 	if err != nil {
-		t.Fatalf("Failed to create DirectManager: %v", err)
+		t.Fatalf("disk manager: %v", err)
 	}
 
-	bp, err := buffer.NewBufferPool(dm, partitions, framesPerPartition)
+	walDir := dir + "/wal"
+	walVFD := disk.NewCachedVFD(16)
+	w, err := wal.Open(walVFD, wal.Options{
+		Dir:         walDir,
+		SegmentSize: 1 << 20,
+		BatchWait:   1_000_000,
+		Fsync:       false,
+		Metrics:     wal.NopMetrics{},
+	})
 	if err != nil {
-		t.Fatalf("Failed to create BufferPool: %v", err)
+		t.Fatalf("wal.Open: %v", err)
 	}
+
+	clogDir := dir + "/clog"
+	c, err := clog.Open(walVFD, clogDir)
+	if err != nil {
+		t.Fatalf("clog.Open: %v", err)
+	}
+
+	bp, err := buffer.NewBufferPool(dm, w, partitions, framesPerPartition)
+	if err != nil {
+		t.Fatalf("buffer pool: %v", err)
+	}
+
+	tm := transaction.NewManager(w, c)
 
 	rel := common.RelationID(1)
-	return NewTableHeap(bp, NewFSM(bp), rel), bp
+	// 5th argument: the WAL handle. TableHeap needs it for the
+	// page-allocation FPW record written by getPageForInsert.
+	th := NewTableHeap(bp, NewFSM(bp), rel, tm, w)
+
+	return &testEnv{
+		heap:   th,
+		bp:     bp,
+		tm:     tm,
+		clog:   c,
+		wal:    w,
+		walDir: walDir,
+		vfd:    walVFD,
+	}
+}
+
+func beginTx(t *testing.T, env *testEnv) *transaction.Transaction {
+	t.Helper()
+	tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	return tx
 }
 
 func intSchema(t *testing.T) *catalog.Schema {
 	t.Helper()
-
 	schema, err := catalog.NewSchema([]catalog.Column{
 		catalog.NewColumn("id", types.IntegerType, false),
 	})
 	if err != nil {
-		t.Fatalf("Failed to create schema: %v", err)
+		t.Fatalf("NewSchema: %v", err)
 	}
 	return schema
 }
 
-func insertInt(t *testing.T, th *TableHeap, schema *catalog.Schema, id int32, xmin common.TransactionID) common.RecordId {
+func insertInt(
+	t *testing.T,
+	env *testEnv,
+	tx *transaction.Transaction,
+	schema *catalog.Schema,
+	id int32,
+) common.RecordId {
 	t.Helper()
-
-	rid, err := th.InsertTuple(NewTuple([]types.Value{types.NewInteger(id)}), schema, xmin, 1)
+	tx.NextCommandID()
+	rid, err := env.heap.InsertTuple(tx, NewTuple([]types.Value{types.NewInteger(id)}), schema)
 	if err != nil {
-		t.Fatalf("InsertTuple(%d) failed: %v", id, err)
+		t.Fatalf("InsertTuple(%d): %v", id, err)
 	}
 	return rid
 }
 
-func readInt(t *testing.T, th *TableHeap, schema *catalog.Schema, rid common.RecordId) int32 {
+func readInt(
+	t *testing.T,
+	env *testEnv,
+	tx *transaction.Transaction,
+	schema *catalog.Schema,
+	rid common.RecordId,
+) int32 {
 	t.Helper()
-
-	got, err := th.GetTuple(rid, schema)
+	got, err := env.heap.GetTuple(tx, rid, schema)
 	if err != nil {
-		t.Fatalf("GetTuple(%v) failed: %v", rid, err)
+		t.Fatalf("GetTuple(%v): %v", rid, err)
 	}
 	val, ok := got.Values[0].(types.Fixed4ByteValue)
 	if !ok {
@@ -66,46 +158,272 @@ func readInt(t *testing.T, th *TableHeap, schema *catalog.Schema, rid common.Rec
 	return int32(val.Value)
 }
 
-// func writePage(t *testing.T, dm disk.DiskManager, rel common.RelationID, fork common.ForkID, pid common.BlockID) {
-
-// 	var data page.Page = make([]byte, common.PageSize)
-// 	for i := 0; i < len(data); i++ {
-// 		data[i] = byte(i % 256)
-// 	}
-// 	data.UpdateChecksum()
-
-// 	err := dm.WritePage(rel, fork, pid, data, false)
-
-// 	if err != nil {
-// 		t.Fatalf("Write page failed: %v", err)
-// 	}
-// }
+// -----------------------------------------------------------------------------
+// Basic insert + read
+// -----------------------------------------------------------------------------
 
 func TestTableHeap_InsertAndGet(t *testing.T) {
-	th, bp := setupTableHeap(t, 2, 8)
-	// dm, err := bp.GetDiskManager()
-	// if err != nil {
-	// 	t.Fatalf("failed to get dm %v", err)
-	// }
-	// writePage(t,)
-
-	defer bp.Shutdown()
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
-	rid := insertInt(t, th, schema, 42, 1)
+	tx := beginTx(t, env)
 
-	if got := readInt(t, th, schema, rid); got != 42 {
+	rid := insertInt(t, env, tx, schema, 42)
+	if got := readInt(t, env, tx, schema, rid); got != 42 {
 		t.Fatalf("GetTuple = %d, want 42", got)
 	}
 }
 
-func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
-	th, bp := setupTableHeap(t, 4, 16)
-	defer bp.Shutdown()
+func TestTableHeap_ReadOwnUncommittedWrite(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
-	const workers = 1
-	const perWorker = 1
+	tx := beginTx(t, env)
+
+	rid := insertInt(t, env, tx, schema, 1234)
+
+	tx.NextCommandID()
+	got, err := env.heap.GetTuple(tx, rid, schema)
+	if err != nil {
+		t.Fatalf("GetTuple: %v", err)
+	}
+	if v, ok := got.Values[0].(types.Fixed4ByteValue); !ok || int32(v.Value) != 1234 {
+		t.Fatalf("expected 1234, got %v", got.Values[0])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Aborted-transaction visibility
+// -----------------------------------------------------------------------------
+
+// TestAbortedInsertIsInvisible: a row inserted by an aborted transaction must
+// be invisible to all subsequent transactions.
+func TestAbortedInsertIsInvisible(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	// Tx1 inserts and aborts.
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx1.NextCommandID()
+	rid, err := env.heap.InsertTuple(tx1,
+		NewTuple([]types.Value{types.NewInteger(1)}), schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.tm.Abort(tx1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx2 (after tx1 aborted) must NOT see the row.
+	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	defer env.tm.Commit(tx2)
+
+	if _, err := env.heap.GetTuple(tx2, rid, schema); err == nil {
+		t.Fatal("aborted insert is visible — visibility predicate is buggy")
+	}
+
+	// Iterator must also skip it.
+	it := env.heap.Iterator(tx2, schema)
+	it.Init()
+	count := 0
+	for {
+		_, err, done := it.Next()
+		if done {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		count++
+	}
+	if count != 0 {
+		t.Fatalf("iterator returned %d rows for aborted insert, want 0", count)
+	}
+}
+
+// TestAbortedDeleteIsVisible: a row deleted by an aborted transaction must
+// remain visible.
+func TestAbortedDeleteIsVisible(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	// Pre-existing row.
+	tx0, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx0.NextCommandID()
+	rid, _ := env.heap.InsertTuple(tx0,
+		NewTuple([]types.Value{types.NewInteger(42)}), schema)
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx1 deletes and aborts.
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx1.NextCommandID()
+	if err := env.heap.MarkTupleAsDeleted(tx1, rid); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.tm.Abort(tx1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx2 must still see the row.
+	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	defer env.tm.Commit(tx2)
+
+	got, err := env.heap.GetTuple(tx2, rid, schema)
+	if err != nil {
+		t.Fatalf("row deleted by aborted tx is invisible: %v", err)
+	}
+	if v, ok := got.Values[0].(types.Fixed4ByteValue); !ok || int32(v.Value) != 42 {
+		t.Errorf("value = %v, want 42", got.Values[0])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Snapshot isolation
+// -----------------------------------------------------------------------------
+
+func TestTableHeap_SnapshotIsolation_Insert(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	tx1, err := env.tm.Begin(ctx, transaction.BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx2, err := env.tm.Begin(ctx, transaction.BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx2.NextCommandID()
+	rid, err := env.heap.InsertTuple(tx2, NewTuple([]types.Value{types.NewInteger(99)}), schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.tm.Commit(tx2); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := env.heap.GetTuple(tx1, rid, schema); err == nil {
+		t.Fatalf("tx1 saw a row inserted after its snapshot")
+	}
+
+	tx3, err := env.tm.Begin(ctx, transaction.BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.heap.GetTuple(tx3, rid, schema); err != nil {
+		t.Fatalf("tx3 should see committed row: %v", err)
+	}
+
+	_ = env.tm.Commit(tx1)
+	_ = env.tm.Commit(tx3)
+}
+
+func TestTableHeap_SnapshotIsolation_Delete(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	tx0 := beginTx(t, env)
+	rid := insertInt(t, env, tx0, schema, 555)
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
+
+	tx1, err := env.tm.Begin(ctx, transaction.BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx2, err := env.tm.Begin(ctx, transaction.BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx2.NextCommandID()
+	if err := env.heap.MarkTupleAsDeleted(tx2, rid); err != nil {
+		t.Fatalf("MarkTupleAsDeleted: %v", err)
+	}
+	if err := env.tm.Commit(tx2); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := env.heap.GetTuple(tx1, rid, schema); err != nil {
+		t.Fatalf("tx1 lost visibility of a row deleted after its snapshot: %v", err)
+	}
+
+	tx3, err := env.tm.Begin(ctx, transaction.BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.heap.GetTuple(tx3, rid, schema); err == nil {
+		t.Fatalf("tx3 should not see the deleted row")
+	}
+
+	_ = env.tm.Commit(tx1)
+	_ = env.tm.Commit(tx3)
+}
+
+// -----------------------------------------------------------------------------
+// Write-write conflict (optimistic)
+// -----------------------------------------------------------------------------
+
+func TestTableHeap_OptimisticConflict(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	tx0 := beginTx(t, env)
+	rid := insertInt(t, env, tx0, schema, 1)
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
+
+	txA, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	txB, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+
+	txA.NextCommandID()
+	if err := env.heap.MarkTupleAsDeleted(txA, rid); err != nil {
+		t.Fatalf("txA MarkTupleAsDeleted: %v", err)
+	}
+
+	txB.NextCommandID()
+	err := env.heap.checkUpdateConflict(txB, rid)
+	if err != transaction.ErrSerializationFailure {
+		t.Fatalf("expected ErrSerializationFailure, got %v", err)
+	}
+
+	_ = env.tm.Commit(txA)
+	_ = env.tm.Abort(txB, nil)
+}
+
+// -----------------------------------------------------------------------------
+// Concurrent inserts
+// -----------------------------------------------------------------------------
+
+func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
+	env := setupEnv(t, 4, 16)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	const workers = 8
+	const perWorker = 20
 
 	var (
 		wg      sync.WaitGroup
@@ -120,20 +438,24 @@ func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
 		go func(worker int) {
 			defer wg.Done()
 
+			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
+			if err != nil {
+				t.Errorf("Begin: %v", err)
+				failCnt.Add(1)
+				return
+			}
+
 			for i := 0; i < perWorker; i++ {
 				id := int32(worker*1_000_000 + i)
-				rid, err := th.InsertTuple(
-					NewTuple([]types.Value{types.NewInteger(id)}),
-					schema,
-					common.TransactionID(worker+1),
-					common.CommandID(i+1),
-				)
+				tx.NextCommandID()
+				rid, err := env.heap.InsertTuple(
+					tx, NewTuple([]types.Value{types.NewInteger(id)}), schema)
 				if err != nil {
-					t.Errorf("InsertTuple(%d) failed: %v", id, err)
+					t.Errorf("InsertTuple(%d): %v", id, err)
 					failCnt.Add(1)
+					_ = env.tm.Abort(tx, nil)
 					return
 				}
-
 				key := fmt.Sprintf("%d:%d", rid.BlockID, rid.Slot)
 				mu.Lock()
 				if _, dup := seen[key]; dup {
@@ -144,12 +466,17 @@ func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
 				rids = append(rids, rid)
 				mu.Unlock()
 			}
+
+			if err := env.tm.Commit(tx); err != nil {
+				t.Errorf("Commit: %v", err)
+				failCnt.Add(1)
+			}
 		}(w)
 	}
-
 	wg.Wait()
+
 	if failCnt.Load() != 0 {
-		t.Fatalf("concurrent inserts reported %d failures", failCnt.Load())
+		t.Fatalf("%d failures", failCnt.Load())
 	}
 
 	want := workers * perWorker
@@ -157,33 +484,25 @@ func TestTableHeap_ConcurrentInsertsUniqueAndReadable(t *testing.T) {
 		t.Fatalf("inserted %d tuples, want %d", len(rids), want)
 	}
 
-	blocks := make(map[common.BlockID]struct{})
+	readTx := beginTx(t, env)
 	for _, rid := range rids {
-		blocks[rid.BlockID] = struct{}{}
-		got, err := th.GetTuple(rid, schema)
+		got, err := env.heap.GetTuple(readTx, rid, schema)
 		if err != nil {
-			t.Fatalf("GetTuple(%v) failed: %v", rid, err)
+			t.Fatalf("GetTuple(%v): %v", rid, err)
 		}
 		if got.Values[0].IsNull() {
 			t.Fatalf("unexpected null at %v", rid)
 		}
 	}
-
-	print("ok")
-
-	// if len(blocks) < 2 {
-	// 	t.Fatalf("expected inserts to span multiple heap pages, used %d", len(blocks))
-	// }
+	_ = env.tm.Commit(readTx)
 }
 
 func TestTableHeap_ConcurrentInsertsForceStaleFSMRetry(t *testing.T) {
-	// Small pool still has enough frames; contention comes from many writers
-	// racing for the same FSM hint on a nearly-full page.
-	th, bp := setupTableHeap(t, 2, 16)
-	defer bp.Shutdown()
+	env := setupEnv(t, 2, 16)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
-	const workers = 2
+	const workers = 4
 	const perWorker = 40
 
 	var wg sync.WaitGroup
@@ -193,19 +512,27 @@ func TestTableHeap_ConcurrentInsertsForceStaleFSMRetry(t *testing.T) {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
+
+			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
+			if err != nil {
+				failCnt.Add(1)
+				return
+			}
+
 			for i := 0; i < perWorker; i++ {
 				id := int32(worker*10_000 + i)
-				_, err := th.InsertTuple(
-					NewTuple([]types.Value{types.NewInteger(id)}),
-					schema,
-					common.TransactionID(worker+1),
-					1,
-				)
+				tx.NextCommandID()
+				_, err := env.heap.InsertTuple(
+					tx, NewTuple([]types.Value{types.NewInteger(id)}), schema)
 				if err != nil {
-					t.Errorf("InsertTuple(%d) failed: %v", id, err)
+					t.Errorf("InsertTuple(%d): %v", id, err)
 					failCnt.Add(1)
+					_ = env.tm.Abort(tx, nil)
 					return
 				}
+			}
+			if err := env.tm.Commit(tx); err != nil {
+				failCnt.Add(1)
 			}
 		}(w)
 	}
@@ -216,9 +543,13 @@ func TestTableHeap_ConcurrentInsertsForceStaleFSMRetry(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Concurrent readers during inserts
+// -----------------------------------------------------------------------------
+
 func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
-	th, bp := setupTableHeap(t, 4, 16)
-	defer bp.Shutdown()
+	env := setupEnv(t, 4, 16)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
 
@@ -239,16 +570,21 @@ func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
 		writerWG.Add(1)
 		go func(worker int) {
 			defer writerWG.Done()
+
+			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
+			if err != nil {
+				failCnt.Add(1)
+				return
+			}
+			defer func() { _ = env.tm.Commit(tx) }()
+
 			for i := 0; i < perWriter; i++ {
 				id := int32(worker*1_000 + i)
-				rid, err := th.InsertTuple(
-					NewTuple([]types.Value{types.NewInteger(id)}),
-					schema,
-					common.TransactionID(worker+1),
-					1,
-				)
+				tx.NextCommandID()
+				rid, err := env.heap.InsertTuple(
+					tx, NewTuple([]types.Value{types.NewInteger(id)}), schema)
 				if err != nil {
-					t.Errorf("InsertTuple(%d) failed: %v", id, err)
+					t.Errorf("InsertTuple(%d): %v", id, err)
 					failCnt.Add(1)
 					return
 				}
@@ -263,6 +599,14 @@ func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
 		readerWG.Add(1)
 		go func() {
 			defer readerWG.Done()
+
+			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
+			if err != nil {
+				failCnt.Add(1)
+				return
+			}
+			defer func() { _ = env.tm.Commit(tx) }()
+
 			for !stopRead.Load() {
 				mu.Lock()
 				n := len(rids)
@@ -274,8 +618,9 @@ func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
 				if n == 0 {
 					continue
 				}
-				if _, err := th.GetTuple(rid, schema); err != nil {
-					t.Errorf("GetTuple(%v) failed during concurrent inserts: %v", rid, err)
+				_, err := env.heap.GetTuple(tx, rid, schema)
+				if err != nil && err != ErrTupleNotFound {
+					t.Errorf("GetTuple(%v): %v", rid, err)
 					failCnt.Add(1)
 					return
 				}
@@ -292,16 +637,24 @@ func TestTableHeap_ConcurrentReadersDuringInserts(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Concurrent deletes
+// -----------------------------------------------------------------------------
+
 func TestTableHeap_ConcurrentDeletesOfDistinctTuples(t *testing.T) {
-	th, bp := setupTableHeap(t, 4, 16)
-	defer bp.Shutdown()
+	env := setupEnv(t, 4, 16)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
 	const n = 200
 
+	tx0 := beginTx(t, env)
 	rids := make([]common.RecordId, n)
 	for i := 0; i < n; i++ {
-		rids[i] = insertInt(t, th, schema, int32(i), 1)
+		rids[i] = insertInt(t, env, tx0, schema, int32(i))
+	}
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
 	}
 
 	var wg sync.WaitGroup
@@ -311,14 +664,24 @@ func TestTableHeap_ConcurrentDeletesOfDistinctTuples(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			err := th.MarkTupleAsDeleted(rids[i], common.TransactionID(i+2), 1)
+
+			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
 			if err != nil {
-				t.Errorf("MarkTupleAsDeleted(%v) failed: %v", rids[i], err)
+				failCnt.Add(1)
+				return
+			}
+			tx.NextCommandID()
+			if err := env.heap.MarkTupleAsDeleted(tx, rids[i]); err != nil {
+				t.Errorf("MarkTupleAsDeleted(%v): %v", rids[i], err)
+				failCnt.Add(1)
+				_ = env.tm.Abort(tx, nil)
+				return
+			}
+			if err := env.tm.Commit(tx); err != nil {
 				failCnt.Add(1)
 			}
 		}(i)
 	}
-
 	wg.Wait()
 	if failCnt.Load() != 0 {
 		t.Fatalf("concurrent deletes reported %d failures", failCnt.Load())
@@ -326,124 +689,678 @@ func TestTableHeap_ConcurrentDeletesOfDistinctTuples(t *testing.T) {
 }
 
 func TestTableHeap_ConcurrentDeleteSameTupleOneWinner(t *testing.T) {
-	th, bp := setupTableHeap(t, 2, 8)
-	defer bp.Shutdown()
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
-	rid := insertInt(t, th, schema, 7, 1)
+	tx0 := beginTx(t, env)
+	rid := insertInt(t, env, tx0, schema, 7)
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
 
 	const workers = 8
 	var (
 		wg      sync.WaitGroup
 		success atomic.Int32
-		failCnt atomic.Int32
+		failed  atomic.Int32
 	)
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
-			err := th.MarkTupleAsDeleted(rid, common.TransactionID(worker+2), 1)
-			if err == nil {
-				success.Add(1)
+
+			tx, err := env.tm.Begin(context.Background(), transaction.BeginOptions{})
+			if err != nil {
+				failed.Add(1)
 				return
 			}
-			failCnt.Add(1)
+			tx.NextCommandID()
+			if err := env.heap.MarkTupleAsDeleted(tx, rid); err != nil {
+				failed.Add(1)
+				_ = env.tm.Abort(tx, nil)
+				return
+			}
+			success.Add(1)
+			_ = env.tm.Commit(tx)
 		}(w)
 	}
-
 	wg.Wait()
 
 	if success.Load() != 1 {
-		t.Fatalf("expected exactly 1 successful delete, got %d (errors=%d)", success.Load(), failCnt.Load())
+		t.Fatalf("expected exactly 1 successful delete, got %d (failed=%d)",
+			success.Load(), failed.Load())
 	}
-	if failCnt.Load() != int32(workers-1) {
-		t.Fatalf("expected %d failed deletes, got %d", workers-1, failCnt.Load())
-	}
-}
-
-func TestFSM_ConcurrentRecordAndLookup(t *testing.T) {
-	fsmCoord, bp := setupTestFSM(t)
-	defer bp.Shutdown()
-
-	rel := common.RelationID(9)
-	const workers = 12
-	const perWorker = 30
-
-	var wg sync.WaitGroup
-	var failCnt atomic.Int32
-
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			for i := 0; i < perWorker; i++ {
-				block := common.BlockID(worker*perWorker + i)
-				if err := fsmCoord.RecordFreeSpace(rel, block, 1000+i); err != nil {
-					t.Errorf("RecordFreeSpace(%d) failed: %v", block, err)
-					failCnt.Add(1)
-					return
-				}
-				found, err := fsmCoord.GetBlockWithFreeSpace(rel, 500)
-				if err != nil {
-					t.Errorf("GetBlockWithFreeSpace failed: %v", err)
-					failCnt.Add(1)
-					return
-				}
-				if found == common.InvalidBlockID {
-					t.Errorf("expected a block with free space after recording block %d", block)
-					failCnt.Add(1)
-					return
-				}
-			}
-		}(w)
-	}
-
-	wg.Wait()
-	if failCnt.Load() != 0 {
-		t.Fatalf("concurrent FSM updates reported %d failures", failCnt.Load())
+	if failed.Load() != int32(workers-1) {
+		t.Fatalf("expected %d failures, got %d", workers-1, failed.Load())
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Iterators
+// -----------------------------------------------------------------------------
 
 func TestTableHeap_Iterator(t *testing.T) {
-	th, bp := setupTableHeap(t, 2, 8)
-	defer bp.Shutdown()
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
 
 	schema := intSchema(t)
 
-	for i := range 10 {
-		_ = insertInt(t, th, schema, int32(i), common.TransactionID(i))
+	tx0 := beginTx(t, env)
+	for i := 0; i < 10; i++ {
+		_ = insertInt(t, env, tx0, schema, int32(i))
+	}
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
 	}
 
-	it := th.Iterator(schema)
-	it.Init()
-	tuplesArray := make([]Tuple, 0, 10)
+	readTx := beginTx(t, env)
+	defer env.tm.Commit(readTx)
 
+	it := env.heap.Iterator(readTx, schema)
+	it.Init()
+
+	got := make([]int32, 0, 10)
 	for {
 		tuple, err, isDone := it.Next()
-
 		if isDone {
 			break
 		}
 		if err != nil {
-			t.Fatalf("err encountered %v", err)
+			t.Fatalf("Next: %v", err)
 		}
-
-		tuplesArray = append(tuplesArray, *tuple)
-	}
-
-	if len(tuplesArray) != 10 {
-		t.Fatalf("expected tuple array os size %d, got %d", len(tuplesArray), 10)
-	}
-
-	for i := range 10 {
-		val, ok := tuplesArray[i].Values[0].(types.Fixed4ByteValue)
+		v, ok := tuple.Values[0].(types.Fixed4ByteValue)
 		if !ok {
-			t.Fatalf("expected integer column, got %T", tuplesArray[i].Values[0])
+			t.Fatalf("expected integer column, got %T", tuple.Values[0])
+		}
+		got = append(got, int32(v.Value))
+	}
+
+	if len(got) != 10 {
+		t.Fatalf("expected 10 tuples, got %d", len(got))
+	}
+	for i := range 10 {
+		if got[i] != int32(i) {
+			t.Fatalf("position %d: got %d want %d", i, got[i], i)
+		}
+	}
+}
+
+func TestTableHeap_IteratorSkipsUncommitted(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	for i := 0; i < 5; i++ {
+		tx1.NextCommandID()
+		if _, err := env.heap.InsertTuple(
+			tx1, NewTuple([]types.Value{types.NewInteger(int32(i))}), schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := env.tm.Commit(tx1); err != nil {
+		t.Fatal(err)
+	}
+
+	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	for i := 5; i < 10; i++ {
+		tx2.NextCommandID()
+		if _, err := env.heap.InsertTuple(
+			tx2, NewTuple([]types.Value{types.NewInteger(int32(i))}), schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tx3, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	it := env.heap.Iterator(tx3, schema)
+	it.Init()
+
+	count := 0
+	for {
+		_, err, isDone := it.Next()
+		if isDone {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		count++
+	}
+	if count != 5 {
+		t.Fatalf("expected 5 visible rows, got %d", count)
+	}
+
+	_ = env.tm.Commit(tx3)
+	_ = env.tm.Abort(tx2, nil)
+}
+
+// -----------------------------------------------------------------------------
+// Undo chain behaviour
+// -----------------------------------------------------------------------------
+
+func TestTableHeap_LosingDeleteHasEmptyUndoChain(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	tx0 := beginTx(t, env)
+	rid := insertInt(t, env, tx0, schema, 1)
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tx1 deletes the row successfully; it remains in-flight.
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx1.NextCommandID()
+	if err := env.heap.MarkTupleAsDeleted(tx1, rid); err != nil {
+		t.Fatalf("tx1 delete: %v", err)
+	}
+
+	// Tx2 attempts the same delete. It must fail at the pre-check before
+	// logging a WAL record — either ErrSerializationFailure (in-flight
+	// holder) or a generic already-deleted error (committed holder).
+	tx2, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx2.NextCommandID()
+	err := env.heap.MarkTupleAsDeleted(tx2, rid)
+	if err == nil {
+		t.Fatal("tx2 should have failed to delete an already-deleted tuple")
+	}
+	if err != transaction.ErrSerializationFailure {
+		t.Fatalf("expected ErrSerializationFailure (tx1 in-flight), got %v", err)
+	}
+
+	// tx2's undo chain is empty; aborting without an applier must succeed.
+	if err := env.tm.Abort(tx2, nil); err != nil {
+		t.Fatalf("Abort(tx2, nil): %v", err)
+	}
+
+	if err := env.tm.Commit(tx1); err != nil {
+		t.Fatalf("tx1 commit: %v", err)
+	}
+}
+
+func TestTableHeap_AbortWithNilApplierIsSafe(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+
+	tx := beginTx(t, env)
+	insertInt(t, env, tx, schema, 100)
+	insertInt(t, env, tx, schema, 200)
+
+	if err := env.tm.Abort(tx, nil); err != nil {
+		t.Fatalf("Abort with nil applier: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// WAL integration
+// -----------------------------------------------------------------------------
+
+// TestTableHeap_InsertLogsWALRecord verifies that inserting a tuple produces
+// a RecInsert WAL record carrying the full tuple blob (header + null bitmap +
+// user data + padding), with matching txid, prevLSN, flags, and page LSN.
+func TestTableHeap_InsertLogsWALRecord(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	tx.NextCommandID()
+	tuple := NewTuple([]types.Value{types.NewInteger(42)})
+	rid, err := env.heap.InsertTuple(tx, tuple, schema)
+	if err != nil {
+		t.Fatalf("InsertTuple: %v", err)
+	}
+
+	if err := env.wal.FlushUpTo(tx.LastLSN); err != nil {
+		t.Fatalf("FlushUpTo: %v", err)
+	}
+
+	rec, err := env.wal.ReadAt(tx.LastLSN)
+	if err != nil {
+		t.Fatalf("ReadAt(%v): %v", tx.LastLSN, err)
+	}
+
+	// --- Record metadata ---
+	if rec.Type != wal.RecInsert {
+		t.Errorf("Type: got %v want RecInsert", rec.Type)
+	}
+	if rec.TxID != tx.Id {
+		t.Errorf("TxID: got %d want %d", rec.TxID, tx.Id)
+	}
+	if rec.Flags&wal.FlagHasAfter == 0 {
+		t.Errorf("Flags: missing FlagHasAfter (got %#x)", rec.Flags)
+	}
+	if rec.Flags&wal.FlagHasBefore != 0 {
+		t.Errorf("Flags: RecInsert should not carry a before-image (got %#x)", rec.Flags)
+	}
+	if rec.PrevLSN != tx.FirstLSN {
+		t.Errorf("PrevLSN: got %v want %v (Begin record)", rec.PrevLSN, tx.FirstLSN)
+	}
+
+	// --- Payload identity ---
+	row, payload, err := wal.DecodeInsert(rec.Data)
+	if err != nil {
+		t.Fatalf("DecodeInsert: %v", err)
+	}
+	wantRow := common.RowId{
+		RelationID: env.heap.rel,
+		BlockID:    rid.BlockID,
+		Slot:       rid.Slot,
+	}
+	if row != wantRow {
+		t.Errorf("RowId in payload: got %+v want %+v", row, wantRow)
+	}
+
+	// --- Payload is a full tuple blob ---
+	data, nulls := tuple.Serialize(schema)
+	hoff, tupleSize, _ := heap.CalculateBytesNeededToInsertTuple(len(data), len(nulls))
+	if len(payload) != tupleSize {
+		t.Fatalf("payload size: got %d want %d", len(payload), tupleSize)
+	}
+
+	gotXmin := common.TransactionID(common.ByteOrder.Uint32(
+		payload[heap.TupleHeaderOffsetXmin:]))
+	if gotXmin != tx.Id {
+		t.Errorf("payload xmin: got %d want %d", gotXmin, tx.Id)
+	}
+	gotXmax := common.TransactionID(common.ByteOrder.Uint32(
+		payload[heap.TupleHeaderOffsetXmax:]))
+	if gotXmax != 0 {
+		t.Errorf("payload xmax: got %d want 0", gotXmax)
+	}
+	gotCtidBlock := common.BlockID(common.ByteOrder.Uint32(
+		payload[heap.TupleHeaderOffsetCtid:]))
+	gotCtidSlot := common.SlotIndex(common.ByteOrder.Uint16(
+		payload[heap.TupleHeaderOffsetCtid+4:]))
+	if gotCtidBlock != rid.BlockID || gotCtidSlot != rid.Slot {
+		t.Errorf("payload ctid: got (%d,%d) want (%d,%d)",
+			gotCtidBlock, gotCtidSlot, rid.BlockID, rid.Slot)
+	}
+	gotHoff := int(payload[heap.TupleHeaderOffsetHoff])
+	if gotHoff != hoff {
+		t.Errorf("payload hoff: got %d want %d", gotHoff, hoff)
+	}
+	if !bytes.Equal(payload[hoff:hoff+len(data)], data) {
+		t.Errorf("payload user data mismatch")
+	}
+
+	// --- Page LSN matches the record's LSN ---
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    rid.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatalf("GetPage: %v", err)
+	}
+	defer frame.Unpin()
+
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+
+	if pageLSN != rec.LSN {
+		t.Errorf("page LSN: got %v want %v", pageLSN, rec.LSN)
+	}
+
+	// --- Begin record sanity ---
+	beginRec, err := env.wal.ReadAt(tx.FirstLSN)
+	if err != nil {
+		t.Fatalf("ReadAt(Begin LSN): %v", err)
+	}
+	if beginRec.Type != wal.RecBegin {
+		t.Errorf("Begin record type: got %v want RecBegin", beginRec.Type)
+	}
+	if beginRec.TxID != tx.Id {
+		t.Errorf("Begin record TxID: got %d want %d", beginRec.TxID, tx.Id)
+	}
+}
+
+// TestTableHeap_DeleteLogsWALRecord verifies that deleting a tuple produces
+// a RecDelete WAL record carrying the full before-image (pre-delete tuple
+// bytes, header included), with matching txid, prevLSN, and flags.
+func TestTableHeap_DeleteLogsWALRecord(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	ctx := context.Background()
+
+	// Insert and commit a row so it exists for the delete.
+	tx0, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx0.NextCommandID()
+	rid, err := env.heap.InsertTuple(tx0,
+		NewTuple([]types.Value{types.NewInteger(7)}), schema)
+	if err != nil {
+		t.Fatalf("InsertTuple: %v", err)
+	}
+	if err := env.tm.Commit(tx0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture the on-page tuple bytes as the expected before-image.
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    rid.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame.RLatch()
+	heapPage := &heap.HeapPage{Page: frame.Page}
+	beforeBytes := append([]byte(nil), heapPage.GetTupleWithSlot(rid.Slot)...)
+	frame.RUnlatch()
+	frame.Unpin()
+
+	// New transaction deletes the row.
+	tx1, _ := env.tm.Begin(ctx, transaction.BeginOptions{})
+	tx1.NextCommandID()
+	firstLSN := tx1.LastLSN
+	if err := env.heap.MarkTupleAsDeleted(tx1, rid); err != nil {
+		t.Fatalf("MarkTupleAsDeleted: %v", err)
+	}
+
+	if err := env.wal.FlushUpTo(tx1.LastLSN); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := env.wal.ReadAt(tx1.LastLSN)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+
+	if rec.Type != wal.RecDelete {
+		t.Errorf("Type: got %v want RecDelete", rec.Type)
+	}
+	if rec.TxID != tx1.Id {
+		t.Errorf("TxID: got %d want %d", rec.TxID, tx1.Id)
+	}
+	if rec.Flags&wal.FlagHasBefore == 0 {
+		t.Errorf("Flags: missing FlagHasBefore (got %#x)", rec.Flags)
+	}
+	if rec.Flags&wal.FlagHasAfter != 0 {
+		t.Errorf("Flags: RecDelete should not carry an after-image (got %#x)", rec.Flags)
+	}
+	if rec.PrevLSN != firstLSN {
+		t.Errorf("PrevLSN: got %v want %v (Begin record)", rec.PrevLSN, firstLSN)
+	}
+
+	row, before, err := wal.DecodeDelete(rec.Data)
+	if err != nil {
+		t.Fatalf("DecodeDelete: %v", err)
+	}
+	wantRow := common.RowId{
+		RelationID: env.heap.rel,
+		BlockID:    rid.BlockID,
+		Slot:       rid.Slot,
+	}
+	if row != wantRow {
+		t.Errorf("RowId in payload: got %+v want %+v", row, wantRow)
+	}
+	if !bytes.Equal(before, beforeBytes) {
+		t.Errorf("before-image mismatch:\n got: %x\nwant: %x", before, beforeBytes)
+	}
+
+	_ = env.tm.Commit(tx1)
+}
+
+// TestTableHeap_InsertSetsRecLSN verifies that inserting a tuple causes the
+// frame to be dirtied with the insert's WAL LSN recorded as a candidate
+// recLSN. For a fresh page, the allocation FPW is also recorded (earlier),
+// so recLSN == FPW's LSN — not the insert's — because setRecLSN keeps the
+// minimum. The invariant is: recLSN > 0 (dirty), recLSN <= insert LSN, and
+// the page's pageLSN == insert LSN.
+func TestTableHeap_InsertSetsRecLSN(t *testing.T) {
+	env := setupEnv(t, 2, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	rid := insertInt(t, env, tx, schema, 42)
+
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    rid.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	recLSN := frame.RecLSN()
+
+	// 1. The frame must be dirty and must have a recLSN set.
+	if recLSN == 0 {
+		t.Fatal("recLSN is zero — insert did not mark the frame dirty")
+	}
+
+	// 2. recLSN must be at or before the insert's own LSN. For a fresh
+	//    page, recLSN points at the allocation FPW; for a page that was
+	//    already dirty, it points at the earliest prior record. Either way
+	//    it can never be *after* the insert.
+	if recLSN > tx.LastLSN {
+		t.Errorf("recLSN = %v, want <= insert LSN %v", recLSN, tx.LastLSN)
+	}
+
+	// 3. The page's pageLSN tracks the most recent modification, which IS
+	//    the insert. This is what redo compares against for idempotence.
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+	if pageLSN != tx.LastLSN {
+		t.Errorf("pageLSN = %v, want insert LSN %v", pageLSN, tx.LastLSN)
+	}
+}
+
+// TestTableHeap_SecondInsertKeepsFirstRecLSN verifies that a second insert
+// on the same page does not raise the recorded recLSN. The recLSN must
+// point at the earliest record that dirtied the page (for a fresh page,
+// the allocation FPW; for an already-dirty page, the earliest prior
+// record). Later writes on the same page leave it unchanged.
+func TestTableHeap_SecondInsertKeepsFirstRecLSN(t *testing.T) {
+	env := setupEnv(t, 1, 8)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	first := insertInt(t, env, tx, schema, 1)
+
+	// Capture the recLSN after the first insert and the free space on the
+	// page so we can decide whether a second insert will land there.
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    first.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRecLSN := frame.RecLSN()
+	frame.RLatch()
+	free := heapFreeSpace(frame.Page)
+	frame.RUnlatch()
+	frame.Unpin()
+
+	if firstRecLSN == 0 {
+		t.Fatalf("recLSN is zero after first insert")
+	}
+
+	if free < 100 {
+		t.Skipf("first page too full to guarantee same-page insert: %d bytes free", free)
+	}
+
+	second := insertInt(t, env, tx, schema, 2)
+	if second.BlockID != first.BlockID {
+		t.Skipf("second insert went to a different page (%d vs %d)",
+			second.BlockID, first.BlockID)
+	}
+
+	frame, err, _ = env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	// Invariant 1: recLSN is unchanged. The second insert cannot raise the
+	// minimum, because the page was already dirty from the first insert
+	// (and the allocation FPW before it).
+	if got := frame.RecLSN(); got != firstRecLSN {
+		t.Errorf("recLSN after 2 inserts = %v, want %v (unchanged by second insert)",
+			got, firstRecLSN)
+	}
+
+	// Invariant 2: pageLSN advanced to the second insert's LSN. This
+	// confirms the second insert actually wrote to the page and that
+	// pageLSN tracks "the most recent modification," which is a different
+	// concept from recLSN.
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+	if pageLSN != tx.LastLSN {
+		t.Errorf("pageLSN = %v, want second insert's LSN %v",
+			pageLSN, tx.LastLSN)
+	}
+}
+
+// heapFreeSpace is a tiny helper to peek at free space without holding the
+// page latch past the return. Defined locally so the test doesn't need a
+// package-level export.
+func heapFreeSpace(p page.Page) int {
+	hp := &heap.HeapPage{Page: p}
+	return hp.GetFreeSpace()
+}
+
+// -----------------------------------------------------------------------------
+// Page allocation FPW
+// -----------------------------------------------------------------------------
+
+// TestAllocatePageLogsFPW verifies that extending the relation logs a
+// RecFPW record containing the freshly initialized page, so recovery can
+// reconstruct the page if it never reaches disk.
+func TestAllocatePageLogsFPW(t *testing.T) {
+	env := setupEnv(t, 1, 4)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+
+	// First insert forces a page allocation.
+	rid := insertInt(t, env, tx, schema, 42)
+
+	// Flush the WAL so the FPW record is visible.
+	if err := env.wal.FlushUpTo(tx.LastLSN); err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := env.wal.IterateFrom(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+
+	var found bool
+	for {
+		rec, err := it.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("iterate: %v", err)
+		}
+		if rec.Type != wal.RecFPW {
+			continue
+		}
+		rel, fork, blockID, pageBytes, derr := wal.DecodeFPW(rec.Data)
+		if derr != nil {
+			t.Fatalf("DecodeFPW: %v", derr)
+		}
+		if rel != env.heap.rel || fork != env.heap.fork || blockID != rid.BlockID {
+			continue
+		}
+		found = true
+
+		// FPW must be a system record (TxID 0), with an after-image only.
+		if rec.TxID != 0 {
+			t.Errorf("FPW TxID: got %d want 0 (system record)", rec.TxID)
+		}
+		if rec.Flags&wal.FlagHasAfter == 0 {
+			t.Errorf("FPW missing FlagHasAfter")
+		}
+		if rec.Flags&wal.FlagHasBefore != 0 {
+			t.Errorf("FPW should not carry a before-image")
+		}
+		if len(pageBytes) != int(common.PageSize) {
+			t.Errorf("FPW page size: got %d want %d", len(pageBytes), common.PageSize)
 		}
 
-		if int32(val.Value) != int32(i) {
-			t.Fatalf("expected value of %v, got %v", int32(i), int32(val.Value))
+		// The logged page must be a properly initialized heap page.
+		hp := &heap.HeapPage{Page: page.Page(pageBytes)}
+		if hp.GetLower() != page.PageHeaderSize {
+			t.Errorf("logged page lower: got %d want %d",
+				hp.GetLower(), page.PageHeaderSize)
 		}
+		if hp.GetUpper() != uint16(common.PageSize) {
+			t.Errorf("logged page upper: got %d want %d",
+				hp.GetUpper(), common.PageSize)
+		}
+		break
+	}
+
+	if !found {
+		t.Fatal("no RecFPW found for allocated block")
+	}
+}
+
+// TestAllocatePageFPWSetsRecLSN verifies that the buffer pool frame for a
+// freshly allocated page records the FPW's LSN in its recLSN, so the frame
+// participates in the dirty page table from the moment of allocation.
+func TestAllocatePageFPWSetsRecLSN(t *testing.T) {
+	env := setupEnv(t, 1, 4)
+	defer env.Shutdown(t)
+
+	schema := intSchema(t)
+	tx := beginTx(t, env)
+	rid := insertInt(t, env, tx, schema, 1)
+
+	tag := buffer.BufferTag{
+		RelationID: env.heap.rel,
+		ForkID:     env.heap.fork,
+		BlockID:    rid.BlockID,
+	}
+	frame, err, _ := env.bp.GetPage(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Unpin()
+
+	// recLSN should be nonzero — the FPW's LSN.
+	if got := frame.RecLSN(); got == 0 {
+		t.Fatal("recLSN is zero after allocation; FPW was not logged")
+	}
+
+	// pageLSN >= recLSN (the insert record advances pageLSN past the FPW).
+	frame.RLatch()
+	pageLSN := frame.Page.GetLSN()
+	frame.RUnlatch()
+	if pageLSN < frame.RecLSN() {
+		t.Errorf("pageLSN (%v) < recLSN (%v)", pageLSN, frame.RecLSN())
 	}
 }

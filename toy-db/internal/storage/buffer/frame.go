@@ -7,6 +7,7 @@ import (
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/storage/page"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
 /*
@@ -61,7 +62,15 @@ type Frame struct {
 
 	ioCond *sync.Cond
 
+	// recLSN is the LSN of the earliest WAL record that dirtied this frame
+	// since it was last flushed. Zero means the frame is either clean or
+	// was dirtied without a WAL record (e.g. by AllocatePage, which is
+	// currently not WAL-logged).
+	recLSN atomic.Uint64
+
 	ptr unsafe.Pointer // only used on Linux for aligned pages
+
+	onEvictable func()
 }
 
 // NewFrame creates a new frame for a page
@@ -146,15 +155,20 @@ func (f *Frame) GetFrameIdentity() BufferTag {
 // once this is set, the frame should be invisible for reuse, till it can be reused
 // panics if pinned
 func (f *Frame) SetFrameIdentity(blockId common.BlockID, forkId common.ForkID, rel common.RelationID) {
-	if f.IsPinned() {
-		panic("Setting identity on pinned frame")
-	}
+	// if f.IsPinned() {
+	// 	panic("Setting identity on pinned frame")
+	// }
 
-	f.bufferTag = BufferTag{
-		BlockID:    blockId,
-		ForkID:     forkId,
-		RelationID: rel,
+	// f.bufferTag = BufferTag{
+	// 	BlockID:    blockId,
+	// 	ForkID:     forkId,
+	// 	RelationID: rel,
+	// }
+
+	if !f.IsIOInProgress() {
+		panic("SetFrameIdentity called without owning IO")
 	}
+	f.bufferTag = BufferTag{BlockID: blockId, ForkID: forkId, RelationID: rel}
 }
 
 // Returns pin count
@@ -214,6 +228,9 @@ func (f *Frame) Unpin() {
 		pins := old & PinCountMask
 		newState := (old & ^PinCountMask) | (pins - 1)
 		if atomic.CompareAndSwapUint32(&f.state, old, newState) {
+			if newState&PinCountMask == 0 && f.onEvictable != nil {
+				f.onEvictable()
+			}
 			return
 		}
 	}
@@ -325,6 +342,10 @@ func (f *Frame) StopIO() {
 	// broadcast that the ioi progress has been cleared
 	f.ioCond.Broadcast()
 	f.ioMu.Unlock()
+
+	if f.onEvictable != nil {
+		f.onEvictable()
+	}
 }
 
 func (f *Frame) WaitIO() {
@@ -334,6 +355,25 @@ func (f *Frame) WaitIO() {
 	}
 	f.ioMu.Unlock()
 }
+
+func (f *Frame) RecLSN() wal.LSN { return wal.LSN(f.recLSN.Load()) }
+
+func (f *Frame) setRecLSN(lsn wal.LSN) {
+	if lsn == 0 {
+		return
+	}
+	for {
+		old := f.recLSN.Load()
+		if old != 0 && old <= uint64(lsn) {
+			return // earlier or equal already recorded
+		}
+		if f.recLSN.CompareAndSwap(old, uint64(lsn)) {
+			return
+		}
+	}
+}
+
+func (f *Frame) clearRecLSN() { f.recLSN.Store(0) }
 
 // -----------------------------------------------------------------------------
 // Reset

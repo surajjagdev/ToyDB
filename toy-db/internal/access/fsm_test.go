@@ -7,7 +7,12 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/storage/buffer"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
 	"github.com/surajjagdev/ToyDB/internal/storage/page/fsm"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
+
+type testLogFlusherFSM struct{}
+
+func (testLogFlusherFSM) FlushUpTo(lsn wal.LSN) error { return nil }
 
 // Helper to set up a real Buffer Pool for testing the Access Layer
 func setupTestFSM(t *testing.T) (*FSM, *buffer.BufferPool) {
@@ -20,7 +25,7 @@ func setupTestFSM(t *testing.T) (*FSM, *buffer.BufferPool) {
 	}
 
 	// BufferPool with 2 partitions, 4 frames each
-	bp, err := buffer.NewBufferPool(dm, 2, 4)
+	bp, err := buffer.NewBufferPool(dm, testLogFlusher{}, 2, 4)
 	if err != nil {
 		t.Fatalf("Failed to create BufferPool: %v", err)
 	}

@@ -16,7 +16,7 @@ type FileNode struct {
 
 type OpenDiskFileFunc func(path string, flags int) (*os.File, error)
 
-type vfdEntry struct {
+type VfdEntry struct {
 	fileNode FileNode
 	flags    int
 	file     *os.File
@@ -32,7 +32,7 @@ type VFDCache struct {
 	capacity int
 
 	// map of elements that are doubly linked
-	cache map[FileNode]*vfdEntry
+	cache map[FileNode]*VfdEntry
 
 	// Ordering: Front = Most Recently Used, Back = Least Recently Used
 	lruList *list.List
@@ -47,7 +47,7 @@ func NewCachedVFD(capacity int) *VFDCache {
 
 	return &VFDCache{
 		capacity: capacity,
-		cache:    make(map[FileNode]*vfdEntry),
+		cache:    make(map[FileNode]*VfdEntry),
 		lruList:  list.New(),
 		openFile: func(path string, flags int) (*os.File, error) {
 			return os.OpenFile(path, flags, 0666)
@@ -58,33 +58,50 @@ func NewCachedVFD(capacity int) *VFDCache {
 func NewDirectVFD(capacity int) *VFDCache {
 	return &VFDCache{
 		capacity: capacity,
-		cache:    make(map[FileNode]*vfdEntry),
+		cache:    make(map[FileNode]*VfdEntry),
 		lruList:  list.New(),
 		openFile: openDirect, // OS-specific
 	}
 }
 
-func (e *vfdEntry) ReadAt(p []byte, off int64) (int, error) {
+func (e *VfdEntry) ReadAt(p []byte, off int64) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.file.ReadAt(p, off)
 }
 
+func (e *VfdEntry) Stat() (os.FileInfo, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.file.Stat()
+}
+
+func (e *VfdEntry) Truncate(sz int64) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.file.Truncate(sz); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // WriteAt serializes writes against reads, writes, and closes.
-func (e *vfdEntry) WriteAt(p []byte, off int64) (int, error) {
+func (e *VfdEntry) WriteAt(p []byte, off int64) (int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.file.WriteAt(p, off)
 }
 
 // Sync flushes the underlying file.
-func (e *vfdEntry) Sync() error {
+func (e *VfdEntry) Sync() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.file.Sync()
 }
 
-func (e *vfdEntry) closeFile() error {
+func (e *VfdEntry) closeFile() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.file == nil {
@@ -104,7 +121,7 @@ func (v *VFDCache) evictOne() (error, bool) {
 			return nil, false
 		}
 
-		entry := lastElement.Value.(*vfdEntry)
+		entry := lastElement.Value.(*VfdEntry)
 
 		if entry.refCount > 0 {
 			lastElement = lastElement.Prev()
@@ -128,7 +145,7 @@ func (v *VFDCache) evictOne() (error, bool) {
 // GetOrOpen retrieves a file handle.
 // If it's cached, it moves to the front (most recently used).
 // If not, it opens the file and evicts the LRU file if at capacity.
-func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
+func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*VfdEntry, error) {
 	// Lock so we don't have a double entry
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -166,7 +183,7 @@ func (v *VFDCache) GetOrOpen(fn FileNode, flags int) (*vfdEntry, error) {
 		return nil, fmt.Errorf("failed to open file %s: %w", fn.Path, err)
 	}
 
-	newEntry := &vfdEntry{
+	newEntry := &VfdEntry{
 		fileNode: fn,
 		file:     file,
 		refCount: 1,
@@ -188,7 +205,7 @@ func (v *VFDCache) CloseAll(force bool) error {
 
 	for ele := v.lruList.Back(); ele != nil; {
 		next := ele.Prev()
-		entry := ele.Value.(*vfdEntry)
+		entry := ele.Value.(*VfdEntry)
 
 		if entry.refCount == 0 || force {
 			if err := entry.closeFile(); err != nil && firstError == nil {
@@ -207,7 +224,7 @@ func (v *VFDCache) CloseAll(force bool) error {
 }
 
 // acquire a entry
-func (v *VFDCache) Acquire(e *vfdEntry) {
+func (v *VFDCache) Acquire(e *VfdEntry) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -216,7 +233,7 @@ func (v *VFDCache) Acquire(e *vfdEntry) {
 }
 
 // release a entry
-func (v *VFDCache) Release(e *vfdEntry) {
+func (v *VFDCache) Release(e *VfdEntry) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -225,4 +242,61 @@ func (v *VFDCache) Release(e *vfdEntry) {
 	}
 
 	e.refCount--
+}
+
+// Rename atomically renames oldPath to newPath.
+//
+// Both paths must be in VFD-managed directories. Any open entries for
+// either path are invalidated: the VFD will close and reopen them on next
+// access.
+func (v *VFDCache) Rename(oldPath, newPath string) error {
+	v.mu.Lock()
+	// Close and evict any open entries for oldPath or newPath.
+	for fn, entry := range v.cache {
+		if fn.Path == oldPath || fn.Path == newPath {
+			entry.closeFile()
+			v.lruList.Remove(entry.elem)
+			entry.elem = nil
+			delete(v.cache, fn)
+		}
+	}
+	v.mu.Unlock()
+
+	return os.Rename(oldPath, newPath)
+}
+
+// SyncDir fsyncs a directory so that renames and creations within it are
+// durable. The path itself is not opened through the VFD — directories are
+// not files and don't participate in fd caching.
+func (v *VFDCache) SyncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// RemoveUnlinked removes a file by path, closing any open entries.
+// This is what Unlink should be if it isn't already implemented that way.
+func (v *VFDCache) RemoveUnlinked(path string) error {
+	v.mu.Lock()
+	for fn, entry := range v.cache {
+		if fn.Path == path {
+			entry.closeFile()
+			v.lruList.Remove(entry.elem)
+			entry.elem = nil
+			delete(v.cache, fn)
+		}
+	}
+	v.mu.Unlock()
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

@@ -1,70 +1,95 @@
 # Makefile for ToyDB
 
-# Default Go commands
 GO := go
 BINARY := toydb
 
-# Directories
 SRC_DIR := ./internal
 TEST_DIR := ./internal/...
 
-# Go build flags
 BUILD_FLAGS := -v
 
-# Detect OS
-UNAME := $(shell uname)
+# Host detection
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Map uname -m to Go GOARCH values
+ifeq ($(UNAME_M),x86_64)
+    HOST_GOARCH := amd64
+else ifeq ($(UNAME_M),arm64)
+    HOST_GOARCH := arm64
+else ifeq ($(UNAME_M),aarch64)
+    HOST_GOARCH := arm64
+else
+    HOST_GOARCH := $(UNAME_M)
+endif
+
+.PHONY: all build linux darwin clean test test-native test-race test-stress-native test-linux test-darwin
+
+all: build
 
 # ----------------------------
 # Build targets
 # ----------------------------
 
-.PHONY: all linux darwin clean test-linux test-darwin test
-
-all: build
-
 build:
-	@echo "Building for current OS..."
-	$(GO) build $(BUILD_FLAGS) -o $(BINARY) 
+	@echo "Building for host ($(UNAME_S)/$(UNAME_M))..."
+	$(GO) build $(BUILD_FLAGS) -o $(BINARY)
+
+# Cross-compiled artifacts. Default GOARCH is amd64; override with GOARCH=arm64.
+GOARCH_LINUX ?= amd64
+GOARCH_DARWIN ?= amd64
 
 linux:
-	@echo "Building for Linux..."
-	GOOS=linux GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(BINARY)_linux 
+	@echo "Cross-compiling for Linux/$(GOARCH_LINUX)..."
+	GOOS=linux GOARCH=$(GOARCH_LINUX) $(GO) build $(BUILD_FLAGS) -o $(BINARY)_linux_$(GOARCH_LINUX)
 
 darwin:
-	@echo "Building for macOS... $(UNAME)"
-	GOOS=darwin GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(BINARY)_darwin 
+	@echo "Cross-compiling for Darwin/$(GOARCH_DARWIN)..."
+	GOOS=darwin GOARCH=$(GOARCH_DARWIN) $(GO) build $(BUILD_FLAGS) -o $(BINARY)_darwin_$(GOARCH_DARWIN)
 
 # ----------------------------
 # Test targets
 # ----------------------------
 
-test: test-linux test-darwin
-
-test-linux:
-	@echo "Running Linux tests..."
-	GOOS=linux GOARCH=amd64 $(GO) test -tags=linux -v $(TEST_DIR)
-
-test-darwin:
-	@echo "Running Darwin tests..."
-	GOOS=darwin GOARCH=amd64 $(GO) test -tags=darwin -v $(TEST_DIR)
+# Default: run tests on the host. This is the only target that works everywhere.
+test:
+	@echo "Running host tests..."
+	$(GO) test -v $(TEST_DIR)
 
 test-native:
-	@echo "Running all tests with GO..."
-	$(GO) test $(TEST_DIR)
+	@echo "Running host tests..."
+	$(GO) test -v $(TEST_DIR)
 
-# Run native tests with the Race Detector enabled to catch concurrency bugs
 test-race:
-	@echo "Running all tests with Race Detector..."
+	@echo "Running host tests with race detector..."
 	$(GO) test -race -v $(TEST_DIR)
 
-# Run native tests 10 times in a row with the Race Detector to catch rare timing bugs
 test-stress-native:
-	@echo "Stress testing concurrency (running all tests 10 times)..."
+	@echo "Stress testing (race detector, 10 runs)..."
 	$(GO) test -race -count=10 -v $(TEST_DIR)
+
+# Platform-specific tests. Only useful on the matching host OS (or with emulation).
+# These are NOT cross-compiled; they run natively on the build host.
+test-linux:
+	@if [ "$(UNAME_S)" != "Linux" ]; then \
+		echo "test-linux requires a Linux host; current host is $(UNAME_S)"; \
+		exit 1; \
+	fi
+	@echo "Running Linux tests..."
+	$(GO) test -race -v $(TEST_DIR)
+
+test-darwin:
+	@if [ "$(UNAME_S)" != "Darwin" ]; then \
+		echo "test-darwin requires a Darwin host; current host is $(UNAME_S)"; \
+		exit 1; \
+	fi
+	@echo "Running Darwin tests on $(UNAME_M)..."
+	$(GO) test -race -v $(TEST_DIR)
 
 # ----------------------------
 # Clean
 # ----------------------------
+
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(BINARY) $(BINARY)_linux $(BINARY)_darwin
+	rm -f $(BINARY) $(BINARY)_linux_* $(BINARY)_darwin_*

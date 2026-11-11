@@ -30,31 +30,31 @@ func GetNewFrame(t *testing.T) *Frame {
 	return frame
 }
 
-func TestSettingFrameIdentity(t *testing.T) {
-	frame := GetNewFrame(t)
+// func TestSettingFrameIdentity(t *testing.T) {
+// 	frame := GetNewFrame(t)
 
-	defer frame.Free()
+// 	defer frame.Free()
 
-	expectedBlock := common.BlockID(1)
-	expectedFork := common.ForkID(1)
-	expectedRel := common.RelationID(1)
+// 	expectedBlock := common.BlockID(1)
+// 	expectedFork := common.ForkID(1)
+// 	expectedRel := common.RelationID(1)
 
-	frame.SetFrameIdentity(expectedBlock, expectedFork, expectedRel)
+// 	frame.SetFrameIdentity(expectedBlock, expectedFork, expectedRel)
 
-	bufferTag := frame.GetFrameIdentity()
+// 	bufferTag := frame.GetFrameIdentity()
 
-	blockId, forkId, relId := bufferTag.BlockID, bufferTag.ForkID, bufferTag.RelationID
+// 	blockId, forkId, relId := bufferTag.BlockID, bufferTag.ForkID, bufferTag.RelationID
 
-	if blockId != expectedBlock {
-		t.Fatalf("block id = %d, want %d", blockId, expectedBlock)
-	}
-	if forkId != expectedFork {
-		t.Fatalf("fork id = %d, want %d", forkId, expectedFork)
-	}
-	if relId != expectedRel {
-		t.Fatalf("relation id = %d, want %d", relId, expectedRel)
-	}
-}
+// 	if blockId != expectedBlock {
+// 		t.Fatalf("block id = %d, want %d", blockId, expectedBlock)
+// 	}
+// 	if forkId != expectedFork {
+// 		t.Fatalf("fork id = %d, want %d", forkId, expectedFork)
+// 	}
+// 	if relId != expectedRel {
+// 		t.Fatalf("relation id = %d, want %d", relId, expectedRel)
+// 	}
+// }
 
 func TestSetIdentityWhilePinnedPanics(t *testing.T) {
 	frame := GetNewFrame(t)

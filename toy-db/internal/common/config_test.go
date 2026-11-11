@@ -65,22 +65,6 @@ func TestMaxCommandID(t *testing.T) {
 	}
 }
 
-// TestInvalidLogSeqNumber tests the InvalidLogSeqNumber constant
-func TestInvalidLogSeqNumber(t *testing.T) {
-	var expected LogSeqNumber = ^LogSeqNumber(0)
-	if InvalidLogSeqNumber != expected {
-		t.Fatalf("InvalidLogSeqNumber = %v, want %v", InvalidLogSeqNumber, expected)
-	}
-}
-
-// TestMaxLogSeqNumber tests the MaxLogSeqNumber constant
-func TestMaxLogSeqNumber(t *testing.T) {
-	var expected LogSeqNumber = InvalidLogSeqNumber - 1
-	if MaxLogSeqNumber != expected {
-		t.Fatalf("MaxLogSeqNumber = %v, want %v", MaxLogSeqNumber, expected)
-	}
-}
-
 func TestDataFileExtension(t *testing.T) {
 	if DataFileExtension != ".data" {
 		t.Fatalf("data file extension not matching expectation of %v", DataFileExtension)

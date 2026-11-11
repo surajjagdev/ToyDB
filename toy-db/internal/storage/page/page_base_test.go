@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
+	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
 func TestAlignTo(t *testing.T) {
@@ -41,7 +42,7 @@ func TestPageInit(t *testing.T) {
 func TestLSNReadWrite(t *testing.T) {
 	p := newTestPage(t)
 
-	lsn := common.LogSeqNumber(12345)
+	lsn := wal.LSN(12345)
 	p.SetLSN(lsn)
 
 	if got := p.GetLSN(); got != lsn {
@@ -80,7 +81,7 @@ func TestPageIDAndLSNReadWrite(t *testing.T) {
 	p := newTestPage(t)
 
 	id := uint32(12345)
-	lsn := common.LogSeqNumber(99999)
+	lsn := wal.LSN(99999)
 
 	p.SetPageId(id)
 	p.SetLSN(lsn)
@@ -211,7 +212,7 @@ func TestChecksumDoesNotIncludeChecksumField(t *testing.T) {
 func TestCheckSumTakesHeadersAndData(t *testing.T) {
 	p := newTestPage(t)
 
-	p.SetLSN(common.InvalidLogSeqNumber / 2)
+	p.SetLSN(wal.InvalidLSN / 2)
 	p.SetPageId((^uint32(0) - 1) / 2)
 	p.SetFlags(PageFlagDeleted)
 	p.SetSpecial(0xA)
