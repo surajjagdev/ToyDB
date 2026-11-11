@@ -22,27 +22,35 @@ type Snapshot struct {
 
 // Visible reports whether a tuple version with the given xmin/xmax is visible
 // to this snapshot.
-func (s *Snapshot) IsVisible(xmin, xmax common.TransactionID,
+func (s *Snapshot) IsVisible(
+	xmin, xmax common.TransactionID,
 	cid common.CommandID,
 	currentTxID common.TransactionID,
 	currentCID common.CommandID,
 	isoLevel IsolationLevel,
-	tm *TransactionManager) bool {
+	tm *TransactionManager,
+) bool {
 	// ==========================================================
 	// RULE 1: Was the tuple created by a visible transaction?
 	// ==========================================================
 	if xmin == currentTxID {
 		if cid >= currentCID {
-			return false // Created during or after this statement began (Halloween Problem)
-		}
-	} else if isoLevel == SnapshotIsolation {
-		if !s.committedInSnapshot(xmin) {
 			return false
 		}
-	} else if isoLevel == ReadCommitted {
-		// ReadCommitted: Check real-time commit status
-		if !s.committedInSnapshot(xmin) {
-			if tm.GetTxnState(xmin) != Committed {
+	} else {
+		committedSnap := s.committedInSnapshot(xmin)
+		if !committedSnap {
+			if isoLevel == ReadCommitted {
+				state := tm.GetTxnState(xmin)
+				if state != Committed {
+					return false
+				}
+			} else {
+				return false
+			}
+		} else {
+			state := tm.GetTxnState(xmin)
+			if state == Aborted {
 				return false
 			}
 		}
@@ -52,32 +60,29 @@ func (s *Snapshot) IsVisible(xmin, xmax common.TransactionID,
 	// RULE 2: Was the tuple deleted/updated by a visible transaction?
 	// ==========================================================
 	if xmax == 0 {
-		return true // Never deleted
+		return true
 	}
 
 	if xmax == currentTxID {
 		if cid >= currentCID {
-			return true // We just deleted it during this exact statement
+			return true
 		}
-		return false // We deleted it in a previous statement
-	}
-
-	if isoLevel == SnapshotIsolation {
-		if s.committedInSnapshot(xmax) {
-			return false // Someone else deleted it before we started
-		}
-		return true // Someone is deleting it right now, or deleted it after we started. Ignore them!
-	}
-
-	// ReadCommitted: Has it committed in real-time?
-	if s.committedInSnapshot(xmax) {
 		return false
 	}
-	if tm.GetTxnState(xmax) == Committed {
-		return false // It died recently while our query was running!
+
+	deleterCommitted := s.committedInSnapshot(xmax)
+	if !deleterCommitted && isoLevel == ReadCommitted {
+		deleterCommitted = tm.GetTxnState(xmax) == Committed
+	}
+	if !deleterCommitted {
+		return true
 	}
 
-	return true
+	deleterState := tm.GetTxnState(xmax)
+	if deleterState == Aborted {
+		return true
+	}
+	return false
 }
 
 func (s *Snapshot) committedInSnapshot(txid common.TransactionID) bool {

@@ -357,6 +357,43 @@ func (m *TransactionManager) NextTxID() common.TransactionID {
 	return m.nextTxID
 }
 
+// returns lowest min txn across all active transactions
+// returns the minimum of snapshot's xmin, not the minimum active txid.
+// bc snapshot's xmin is lowest xid that was in-flight when snapshot was taken
+// even if the txn that was active at snapshot was completed, their effects
+// are still visible
+func (m *TransactionManager) OldestActiveSnapshot() common.TransactionID {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.sortedActive) == 0 {
+		// no active txns
+		return m.nextTxID
+	}
+
+	var oldest common.TransactionID
+	first := true
+
+	for _, txid := range m.sortedActive {
+		tx := m.active[txid]
+
+		if tx == nil {
+			continue
+		}
+
+		if first || tx.Snapshot.XMin < oldest {
+			oldest = tx.Snapshot.XMin
+			first = false
+		}
+	}
+
+	if first {
+		return m.nextTxID
+	}
+
+	return oldest
+}
+
 // -----------------------------------------------------------------------------
 // Wait-for-completion
 // -----------------------------------------------------------------------------
