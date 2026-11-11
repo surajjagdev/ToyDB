@@ -423,11 +423,11 @@ func (h *HeapPage) DeleteTuple(
 	xmax common.TransactionID,
 	cid common.CommandID,
 ) error {
-	slotOffset := getSlotOffset(slot)
-
 	if exists := h.validateSlot(slot); !exists {
 		return fmt.Errorf("invalid slot %d", slot)
 	}
+
+	slotOffset := getSlotOffset(slot)
 
 	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
 	tupleOffset, flags, size := h.UnpackItemId(v)
@@ -462,6 +462,42 @@ func (h *HeapPage) DeleteTuple(
 		tuple[TupleHeaderOffsetCid:TupleHeaderOffsetCid+4],
 		uint32(cid),
 	)
+
+	return nil
+}
+
+// VacuumTuple marks the slot as ItemIdFlagUnused, reclaiming its bytes for
+// future reuse. The caller has already verified that the tuple is dead
+// (XMax committed and below the oldest active snapshot's XMin). This
+// function does no visibility checking; it just flips the flags.
+//
+// Idempotent: if the slot is already unused or deleted, returns nil.
+func (h *HeapPage) VacuumTuple(
+	slot common.SlotIndex,
+) error {
+	if exists := h.validateSlot(slot); !exists {
+		return fmt.Errorf("invalid slot %d", slot)
+	}
+
+	slotOffset := getSlotOffset(slot)
+
+	// check slot flags
+	v := common.ByteOrder.Uint32(h.Page[slotOffset : slotOffset+ItemIdSize])
+	tupleOffset, flags, size := h.UnpackItemId(v)
+
+	if flags == uint8(ItemIdFlagDeleted) || flags == uint8(ItemIdFlagUnused) {
+		return nil
+	}
+
+	if flags != uint8(ItemIdFlagNormal) {
+		return fmt.Errorf(
+			"vacuum: slot %d has flags %d (want normal)", slot, flags,
+		)
+	}
+
+	// set flag to be reused
+	newV := packItemId(tupleOffset, uint8(ItemIdFlagUnused), size)
+	common.ByteOrder.PutUint32(h.Page[slotOffset:slotOffset+ItemIdSize], newV)
 
 	return nil
 }

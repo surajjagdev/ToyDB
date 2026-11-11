@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/surajjagdev/ToyDB/internal/catalog"
 	"github.com/surajjagdev/ToyDB/internal/common"
@@ -36,6 +37,10 @@ type TableHeap struct {
 	tm       *transaction.TransactionManager
 	wal      *wal.WAL // for system records: page-allocation FPWs
 	extendMu sync.Mutex
+
+	// counters
+	liveTuples atomic.Uint64
+	deadTuples atomic.Uint64
 }
 
 func NewTableHeap(
@@ -46,13 +51,22 @@ func NewTableHeap(
 	w *wal.WAL,
 ) *TableHeap {
 	return &TableHeap{
-		bp:   bp,
-		fsm:  fsm,
-		rel:  rel,
-		fork: common.ForkMain,
-		tm:   tm,
-		wal:  w,
+		bp:         bp,
+		fsm:        fsm,
+		rel:        rel,
+		fork:       common.ForkMain,
+		tm:         tm,
+		wal:        w,
+		liveTuples: atomic.Uint64{},
+		deadTuples: atomic.Uint64{},
 	}
+}
+
+type VacuumStats struct {
+	PagesScanned  int
+	TuplesRemoved int
+	PagesModified int
+	ReclaimedRIDs []common.RowId // for Phase 4 index cleanup
 }
 
 // -----------------------------------------------------------------------------
@@ -238,6 +252,8 @@ func (th *TableHeap) InsertTuple(
 			frame.Unpin()
 			return common.RecordId{}, fmt.Errorf("install tuple: %w", err)
 		}
+
+		th.liveTuples.Add(1)
 
 		// 5. Record the WAL position on the page so the buffer pool can
 		// enforce the write-ahead rule when flushing.
@@ -473,6 +489,8 @@ func (th *TableHeap) MarkTupleAsDeleted(
 		return fmt.Errorf("delete tuple %v: %w", rId, err)
 	}
 
+	th.deadTuples.Add(1)
+
 	// 3. Record the WAL position.
 	frame.Page.SetLSN(lsn)
 
@@ -573,6 +591,140 @@ func (th *TableHeap) SelectForShare(
 		return nil, fmt.Errorf("lock row for share: %w", err)
 	}
 	return th.currentVersion(rId, schema)
+}
+
+// LiveTupleCount returns the number of live tuple versions.
+func (th *TableHeap) LiveTupleCount() uint64 { return th.liveTuples.Load() }
+
+// DeadTupleCount returns the number of logically deleted versions.
+func (th *TableHeap) DeadTupleCount() uint64 { return th.deadTuples.Load() }
+
+// TupleCounts returns (live, dead) in one call. Used by vacuum's bloat
+// threshold check.
+func (th *TableHeap) TupleCounts() (live, dead uint64) {
+	return th.liveTuples.Load(), th.deadTuples.Load()
+}
+
+// VacuumPage removes dead tuple versions from a single page.
+//
+// "Dead" means: XMax is set, IsCommitted(XMax) is true, and XMax is
+// strictly below oldestXmin. Such a version cannot be seen by any current
+// or future transaction.
+//
+// Not WAL-logged: a crash mid-vacuum leaves some slots reclaimed and some
+// not. The next vacuum pass catches the rest. This is what Postgres does
+// for regular VACUUM.
+func (th *TableHeap) VacuumPage(
+	blockID common.BlockID,
+	oldestXmin common.TransactionID,
+) (removed int, reclaimed []common.RowId, modified bool, err error) {
+	tag := buffer.BufferTag{
+		RelationID: th.rel,
+		ForkID:     th.fork,
+		BlockID:    blockID,
+	}
+	frame, err, _ := th.bp.GetPage(tag)
+	if err != nil {
+		return 0, nil, false, fmt.Errorf("vacuum page %d: %w", blockID, err)
+	}
+	defer frame.Unpin()
+
+	frame.WLatch()
+	defer frame.WUnlatch()
+
+	hp := &heap.HeapPage{Page: frame.Page}
+	numSlots := hp.GetNumSlots()
+
+	for i := 0; i < numSlots; i++ {
+		slot := common.SlotIndex(i)
+		if !hp.DoesTupleInSlotExist(slot) {
+			continue
+		}
+		header, err := hp.GetTupleHeader(slot)
+		if err != nil {
+			continue // corrupt slot; skip
+		}
+
+		if header.XMax == 0 {
+			continue // live, not deleted
+		}
+		if th.tm.IsInProgress(header.XMax) {
+			continue // deleter still running
+		}
+		committed, err := th.tm.IsCommitted(header.XMax)
+		if err != nil || !committed {
+			continue // aborted deleter — tuple is actually live
+		}
+		if header.XMax >= oldestXmin {
+			continue // some active snapshot can still see it
+		}
+
+		if err := hp.VacuumTuple(slot); err != nil {
+			continue
+		}
+		removed++
+		modified = true
+		reclaimed = append(reclaimed, common.RowId{
+			RelationID: th.rel,
+			BlockID:    blockID,
+			Slot:       slot,
+		})
+	}
+
+	if modified {
+		// Page content changed. Mark dirty without advancing LSN — vacuum
+		// has no WAL record. The frame's existing recLSN stays, so redo
+		// won't try to replay anything vacuum-specific.
+		th.bp.MarkDirtyWithLSN(frame, frame.Page.GetLSN())
+		if removed > 0 {
+			th.deadTuples.Add(^uint64(removed - 1)) // subtract `removed`
+		}
+	}
+
+	return removed, reclaimed, modified, nil
+}
+
+func (th *TableHeap) VacuumRelation(
+	oldestXmin common.TransactionID,
+) (VacuumStats, error) {
+	var stats VacuumStats
+
+	dm, err := th.bp.GetDiskManager()
+	if err != nil {
+		return stats, fmt.Errorf("vacuum: disk manager: %w", err)
+	}
+	pageCount, err := dm.GetNumPages(th.rel, th.fork)
+	if err != nil {
+		return stats, fmt.Errorf("vacuum: page count: %w", err)
+	}
+
+	for blockID := common.BlockID(0); blockID < pageCount; blockID++ {
+		removed, rids, modified, err := th.VacuumPage(blockID, oldestXmin)
+		if err != nil {
+			return stats, fmt.Errorf("vacuum: page %d: %w", blockID, err)
+		}
+		stats.PagesScanned++
+		stats.TuplesRemoved += removed
+		stats.ReclaimedRIDs = append(stats.ReclaimedRIDs, rids...)
+		if modified {
+			stats.PagesModified++
+			// Refresh FSM with the page's new free space.
+			tag := buffer.BufferTag{
+				RelationID: th.rel,
+				ForkID:     th.fork,
+				BlockID:    blockID,
+			}
+			if frame, err, _ := th.bp.GetPage(tag); err == nil {
+				frame.RLatch()
+				free := (&heap.HeapPage{Page: frame.Page}).GetFreeSpace()
+				frame.RUnlatch()
+				frame.Unpin()
+				_ = th.fsm.RecordFreeSpace(th.rel, blockID, free)
+			}
+		}
+	}
+
+	return stats, nil
 }
 
 // -----------------------------------------------------------------------------

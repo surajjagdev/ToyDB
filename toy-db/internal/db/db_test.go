@@ -249,5 +249,67 @@ func TestDBRepeatedOpenClose(t *testing.T) {
 	}
 }
 
+func TestDBBackgroundVacuum(t *testing.T) {
+	dir := t.TempDir()
+
+	d, err := db.Open(context.Background(), db.Options{
+		Dir:                dir,
+		Fsync:              false,
+		CheckpointInterval: time.Hour, // disabled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close(context.Background())
+
+	schema := intSchema(t)
+
+	// 1. Insert a row, then update it many times to create dead versions.
+	ctx := context.Background()
+	tx0, _ := d.TM().Begin(ctx, transaction.BeginOptions{})
+	tx0.NextCommandID()
+	rid, _ := d.Heap(1).InsertTuple(tx0,
+		access.NewTuple([]types.Value{types.NewInteger(1)}), schema)
+	d.TM().Commit(tx0)
+
+	for i := 0; i < 100; i++ {
+		tx, _ := d.TM().Begin(ctx, transaction.BeginOptions{})
+		tx.NextCommandID()
+		newRid, err := d.Heap(1).UpdateTuple(tx, rid,
+			access.NewTuple([]types.Value{types.NewInteger(int32(i + 2))}), schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.TM().Commit(tx)
+		rid = newRid
+	}
+
+	// 2. Verify dead versions accumulated.
+	if d.Heap(1).DeadTupleCount() == 0 {
+		t.Fatal("no dead versions; test setup broken")
+	}
+
+	// 3. Force a vacuum pass synchronously.
+	if err := d.Vacuumer().Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Dead versions should be reclaimed.
+	if got := d.Heap(1).DeadTupleCount(); got != 0 {
+		t.Errorf("dead versions after vacuum: %d, want 0", got)
+	}
+
+	// 5. The live row must be readable.
+	txr, _ := d.TM().Begin(ctx, transaction.BeginOptions{})
+	defer d.TM().Commit(txr)
+	tuple, err := d.Heap(1).GetTuple(txr, rid, schema)
+	if err != nil {
+		t.Fatalf("live row lost: %v", err)
+	}
+	if v, ok := tuple.Values[0].(types.Fixed4ByteValue); !ok || int32(v.Value) != 101 {
+		t.Errorf("live value = %v, want 101", tuple.Values[0])
+	}
+}
+
 // Silence unused import warning for common.
 var _ = common.RelationID(1)

@@ -19,6 +19,7 @@ import (
 	"github.com/surajjagdev/ToyDB/internal/storage/buffer"
 	"github.com/surajjagdev/ToyDB/internal/storage/disk"
 	"github.com/surajjagdev/ToyDB/internal/transaction"
+	"github.com/surajjagdev/ToyDB/internal/vacuum"
 	"github.com/surajjagdev/ToyDB/internal/wal"
 )
 
@@ -37,6 +38,8 @@ type Options struct {
 	// CheckpointInterval is the maximum time between checkpoints.
 	// Zero uses checkpoint.DefaultInterval.
 	CheckpointInterval time.Duration
+
+	VacuumInterval time.Duration
 
 	// WALSizeThreshold triggers a checkpoint when WAL grows past this.
 	// Zero uses checkpoint.DefaultWALSizeThreshold.
@@ -60,6 +63,7 @@ type DB struct {
 	bp      *buffer.BufferPool
 	clog    *clog.Manager
 	tm      *transaction.TransactionManager
+	vac     *vacuum.Vacuumer
 	heaps   map[common.RelationID]*access.TableHeap
 	applier *access.HeapApplier
 	ckpt    *checkpoint.Manager
@@ -144,6 +148,13 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 		LogProgress:      opts.LogProgress,
 	}, d.wal, d.tm, d.bp)
 	d.ckpt.Start()
+
+	// vaccumer
+	d.vac = vacuum.New(vacuum.Options{
+		Interval:    opts.VacuumInterval,
+		LogProgress: d.opts.LogProgress,
+	}, d.tm, d.heaps)
+	d.vac.Start()
 
 	return d, nil
 }
@@ -254,6 +265,9 @@ func (d *DB) RecoveryResult() *recovery.RecoveryResult { return d.recoveryResult
 // CheckpointManager returns the background checkpoint manager.
 func (d *DB) CheckpointManager() *checkpoint.Manager { return d.ckpt }
 
+// returns background vacuumer
+func (d *DB) Vacuumer() *vacuum.Vacuumer { return d.vac }
+
 // -----------------------------------------------------------------------------
 // Shutdown
 // -----------------------------------------------------------------------------
@@ -288,7 +302,12 @@ func (d *DB) Close(ctx context.Context) error {
 		}
 	}
 
-	// 1. Stop the checkpoint loop.
+	// 1. close vacuum first
+	if d.vac != nil {
+		d.vac.Stop()
+	}
+
+	// 2. Stop the checkpoint loop.
 	if d.ckpt != nil {
 		d.ckpt.Stop()
 		// 2. Final checkpoint — bounded by the caller's context.

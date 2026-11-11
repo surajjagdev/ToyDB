@@ -303,3 +303,33 @@ func TestCanDeleteTupleIsReadOnly(t *testing.T) {
 		t.Error("CanDeleteTuple mutated page pointers")
 	}
 }
+
+func TestVacuumTupleBasic(t *testing.T) {
+	p := newTestPage(t)
+	blob := p.BuildTupleBytes([]byte("payload"), nil, 1, 0, 100, 0, 1)
+	p.ReplayInsert(0, blob)
+
+	if err := p.VacuumTuple(0); err != nil {
+		t.Fatal(err)
+	}
+	if p.DoesTupleInSlotExist(0) {
+		t.Error("slot still holds tuple after vacuum")
+	}
+}
+
+func TestVacuumTupleIdempotent(t *testing.T) {
+	p := newTestPage(t)
+	blob := p.BuildTupleBytes([]byte("payload"), nil, 1, 0, 100, 0, 1)
+	p.ReplayInsert(0, blob)
+	p.VacuumTuple(0)
+	if err := p.VacuumTuple(0); err != nil {
+		t.Fatalf("idempotent vacuum: %v", err)
+	}
+}
+
+func TestVacuumTupleInvalidSlot(t *testing.T) {
+	p := newTestPage(t)
+	if err := p.VacuumTuple(999); err == nil {
+		t.Fatal("expected error for out-of-range slot")
+	}
+}

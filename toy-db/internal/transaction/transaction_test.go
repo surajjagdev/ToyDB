@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/surajjagdev/ToyDB/internal/common"
 	"github.com/surajjagdev/ToyDB/internal/lock"
@@ -348,12 +349,14 @@ func TestDoneChannelClosedOnCommit(t *testing.T) {
 	default:
 	}
 
-	_ = tm.Commit(tx)
+	if err := tm.Commit(tx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
 
 	// Now closed.
 	select {
 	case <-tx.done:
-	case <-timeAfter(500):
+	case <-time.After(500 * time.Millisecond):
 		t.Fatal("done channel not closed after commit")
 	}
 }
